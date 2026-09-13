@@ -115,7 +115,7 @@
 <header>
   <div class="eyebrow">Methods · Mercurius 0.8B</div>
   <h1>Mercurius Conversion Recipe</h1>
-  <p class="sub">Turning a trained Qwen3.5 into a cheaper-to-serve architecture, and adapting it back to health, entirely on one 64&nbsp;GB Jetson.</p>
+  <p class="sub">Converting a trained Qwen3.5 into a cheaper architecture and repairing it by distillation, on one 64&nbsp;GB Jetson.</p>
   <dl class="facts">
     <div><dt>Base</dt><dd>Qwen3.5-0.8B</dd></div>
     <div><dt>Hardware</dt><dd>Jetson AGX Orin 64&nbsp;GB</dd></div>
@@ -126,7 +126,7 @@
 
 <section>
   <h2>The five stages</h2>
-  <p class="lede">Each runs on the output of the last, at full precision, before any quantization. Every stage that claims exactness has to prove it against a matched perturbation control — absolute thresholds are unusable here, since a 1e-7 perturbation moves logits by 5e-3.</p>
+  <p class="lede">Each stage runs on the output of the previous one, at full precision, before any quantization. A stage that claims exactness is checked against a matched perturbation control. Absolute thresholds do not work here: a 1e-7 perturbation moves logits by 5e-3.</p>
 
   <div class="stage">
     <div class="stage-key">A</div>
@@ -290,7 +290,7 @@ python src/<b>train_recovery.py</b> \
 </section>
 
 <section>
-  <h2>Infrastructure that is load-bearing</h2>
+  <h2>Implementation constraints</h2>
   <ul>
     <li><strong>fp32 norm gains.</strong> At <code>w ≈ 0.5</code> the bf16 ULP is <span class="num">3.91e-3</span> while an Adam step at 2e-4 is ~2e-4 — the update rounds to <strong>exactly zero</strong>. All 55,552 gains are cast to fp32; <code>q_norm</code>/<code>k_norm</code> receive no gradient at all otherwise.</li>
     <li><strong>Checkpoint on <code>requires_grad</code>, never a name list.</strong> A hardcoded filter silently discarded <code>in_proj_a</code>'s 37.7 M dense parameters — the run trained them, the eval curve showed the benefit, the weights were dropped on save.</li>
@@ -312,7 +312,7 @@ python src/<b>train_recovery.py</b> \
 </section>
 
 <footer>
-  <p>Mercurius is the Roman god of translation and of boundaries — of carrying something across into a new form, and of doing it quickly. These models are Qwen3.5 carried across into a cheaper architecture, not built from nothing. Sizes are parameter counts; the family name is the only mythological one.</p>
+  <p>Sizes are given as parameter counts. The family name is the only mythological one.</p>
 </footer>
 
 </div>
