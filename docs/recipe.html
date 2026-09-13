@@ -119,7 +119,7 @@
   <dl class="facts">
     <div><dt>Base</dt><dd>Qwen3.5-0.8B</dd></div>
     <div><dt>Hardware</dt><dd>Jetson AGX Orin 64&nbsp;GB</dd></div>
-    <div><dt>Trainable</dt><dd>293.91 M / 791.7 M</dd></div>
+    <div><dt>Trainable</dt><dd>293.91 M / 791.7 M<sup>*</sup></dd></div>
     <div><dt>Corpus</dt><dd>FineWeb-Edu, 26.3 M tok</dd></div>
   </dl>
 </header>
@@ -194,6 +194,35 @@ python src/<b>train_recovery.py</b> \
 
 <section>
   <h2>Adaptation surface</h2>
+
+  <div class="trap">
+    <h4>Corrections since this was written</h4>
+    <p><strong>The parameter counts below are wrong, and the conclusion they
+    support is no longer established.</strong> Three findings landed after this
+    section was drafted; <code>docs/findings.md</code> §2.0–2.0d carries the
+    measurements.</p>
+    <p style="margin-top:10px"><strong>1. Every run had two LoRA adapters per
+    target.</strong> <code>train_recovery</code> injects LoRA twice when
+    <code>--init-adapters</code> is set, and <code>inject_lora</code> matched
+    rule patterns by substring — so the second pass wrapped the
+    <code>.base</code> of every already-wrapped module. The result was
+    <code>base(x) + lora_inner(x) + lora_outer(x)</code>: effectively rank 32 at
+    2× the adapter parameters. Every LoRA figure in the table is therefore
+    double the intended one, and the 293.91 M total is inflated.</p>
+    <p style="margin-top:10px"><strong>2. The LoRA arms were handicapped by the
+    learning rate.</strong> A single parameter group put the adapters on the
+    dense-safe 3e-5, roughly 5–10× below normal LoRA practice. Re-running the
+    LoRA-heavy arm with adapters at 2e-4 recovered <span class="num">41%</span>
+    of its gap to the dense surface — so "dense is worth it" was partly a
+    statement about an untuned learning rate.</p>
+    <p style="margin-top:10px"><strong>3. <code>in_proj_a</code> is
+    low-rank.</strong> Its update needs rank ~22–26 where every other KDA
+    operator needs 180–300, because Stage B builds it by
+    <code>repeat_interleave</code> and it starts at exactly rank 16. Its rank is
+    still climbing at step 150, so it should stay dense rather than be
+    constrained — but the arm that made it dense while giving the high-rank
+    operators rank-16 adapters had the allocation exactly inverted.</p>
+  </div>
   <p>What is frozen, what gets a low-rank adapter, and what is trained densely. The attention and linear-attention parameters are trained in full; LoRA is confined to the FFN.</p>
 
   <div class="tw">
@@ -208,7 +237,7 @@ python src/<b>train_recovery.py</b> \
         <tr><td>mlp.gate / up / down</td><td>LoRA</td><td>16</td><td>10.62 M</td></tr>
         <tr><td>all normalization gains</td><td class="dense">dense, fp32</td><td>—</td><td>0.05 M</td></tr>
         <tr><td>embed_tokens / lm_head (tied)</td><td class="frozen">frozen</td><td>—</td><td class="frozen">0</td></tr>
-        <tr class="total"><td>total</td><td></td><td></td><td>293.91 M</td></tr>
+        <tr class="total"><td>total<sup>*</sup></td><td></td><td></td><td>293.91 M</td></tr>
       </tbody>
     </table>
   </div>
