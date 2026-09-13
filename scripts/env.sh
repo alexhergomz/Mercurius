@@ -1,5 +1,5 @@
 # source this before any work in this project
-export PROJ=/home/srdelam/qwen-surgery
+export PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export HF_HOME="$PROJ/models/hf"
 export HF_HUB_CACHE="$PROJ/models/hf/hub"
 export TRITON_CACHE_DIR="$PROJ/env/triton-cache"

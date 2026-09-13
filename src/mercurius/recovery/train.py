@@ -27,7 +27,8 @@ from mercurius.models.kda import (load_kda_model, enable_state_passing, reset_st
                        promote_state)
 from mercurius.surgery.norm_fusion import get_trunk
 from mercurius.surgery.rope_dial import install_rope_dial
-from mercurius.adapters.lora import inject_lora, freeze_base, trainable_parameters
+from mercurius.adapters.lora import (inject_lora, freeze_base, trainable_parameters,
+                  merge_and_restart, merged_base_names)
 from mercurius.eval.characterize import perplexity
 from mercurius.eval.suite import ce_and_topk, sample, report, PROMPTS
 import bitsandbytes as bnb
@@ -88,6 +89,8 @@ def save_trainable(model, path):
     Keying off requires_grad cannot go stale.
     """
     names = {n for n, p in model.named_parameters() if p.requires_grad}
+    # A merged base is frozen but CHANGED -- requires_grad cannot see it.
+    names |= merged_base_names(model)
     sd = model.state_dict()
     torch.save({k: sd[k].detach().cpu() for k in sorted(names) if k in sd}, path)
     return len(names)
@@ -380,6 +383,13 @@ def main():
     ap.add_argument("--head-chunk", type=int, default=2048,
                     help="positions per lm_head chunk in the cached-KL path; "
                          "bounds peak head memory independently of seq length")
+    ap.add_argument("--kda-rank", type=int, default=None,
+                    help="override the LoRA rank on the KDA projections "
+                         "(in_proj_qkv, in_proj_z, out_proj). Default 16.")
+    ap.add_argument("--relora-every", type=int, default=0,
+                    help="ReLoRA: merge every adapter into its base and restart "
+                         "it from zero every N steps. Cumulative rank becomes "
+                         "N_merges*r while only r is ever resident. 0 = off.")
     ap.add_argument("--lora-lr", type=float, default=None,
                     help="separate LR for LoRA adapters (A/B and the KDA gate "
                          "adapters). Without it they share the dense group's "
@@ -483,7 +493,12 @@ def main():
             if sa is not None and hasattr(sa.k_proj, "latent"):
                 mla_latents.append(sa.k_proj.latent)
 
-    inject_lora(student, LORA_RULES)
+    rules = LORA_RULES
+    if a.kda_rank:
+        rules = [(p, a.kda_rank if p.startswith('linear_attn.') else r)
+                 for p, r in LORA_RULES]
+        print(f'  KDA projection LoRA rank -> {a.kda_rank}', flush=True)
+    inject_lora(student, rules)
     # Substring matching against parameter names. LoRA-wrapped modules expose
     # their frozen base as "<mod>.base.weight", so a module-prefix pattern like
     # "linear_attn." unfreezes the dense base AND its adapter together -- which
@@ -810,6 +825,10 @@ def main():
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
+        if a.relora_every and step > 0 and step % a.relora_every == 0:
+            nm = merge_and_restart(student, opt)
+            print(f'  [relora] merged and restarted {nm} adapters at step '
+                  f'{step} (merge {step//a.relora_every})', flush=True)
         if a.state_passing:
             promote_state(student)   # after backward, so recompute stays valid
         hist["loss"].append(loss.item())

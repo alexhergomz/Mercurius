@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -u
-cd /home/srdelam/qwen-surgery
+cd "$(dirname "$0")/.."
 source env.sh
 if [ -n "123139" ]; then
   while kill -0 123139 2>/dev/null; do sleep 60; done

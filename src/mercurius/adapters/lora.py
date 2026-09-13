@@ -71,6 +71,58 @@ def inject_lora(model, rules, verbose=True):
     return injected
 
 
+def merge_and_restart(model, optimizer=None):
+    """ReLoRA-style rank accumulation: fold each adapter into its base, then
+    restart the adapter from zero.
+
+    A rank-r adapter can only ever move the weight within an r-dimensional
+    subspace. Merging releases that constraint: after k merges the accumulated
+    update can reach rank k*r while never holding more than r(m+n) trainable
+    parameters at once. Measured on this model, the dense update needs rank ~300
+    on in_proj_qkv, which costs 2.1 M as a single factorization but only
+    r(m+n) at a time this way.
+
+    Two details that make or break it:
+
+    1. THE OPTIMIZER STATE MUST BE DROPPED for the restarted factors. Adam's
+       moments encode the direction the old subspace was moving in; carried
+       across a merge they immediately drag the freshly initialized factors back
+       into the subspace we just escaped, which is the whole point of merging.
+
+    2. THE MERGED BASE MUST BE SAVED. base.weight is frozen, so a checkpointer
+       keyed on requires_grad -- which is what save_trainable does, deliberately
+       -- will not write it, and every merged update is silently lost at save
+       time. This is the third instance of that failure mode in this project
+       (the hardcoded name filter dropped in_proj_a, the substring match
+       double-wrapped adapters), so modules are tagged here and the saver reads
+       the tag rather than inferring anything.
+    """
+    n = 0
+    for mod in model.modules():
+        if not isinstance(mod, LoRALinear):
+            continue
+        with torch.no_grad():
+            delta = (mod.lora_B.float() @ mod.lora_A.float()) * mod.scale
+            mod.base.weight.data += delta.to(mod.base.weight.dtype)
+            nn.init.kaiming_uniform_(mod.lora_A, a=math.sqrt(5))
+            mod.lora_B.zero_()
+        mod.merged = True                      # read by save_trainable
+        if optimizer is not None:
+            for p in (mod.lora_A, mod.lora_B):
+                optimizer.state.pop(p, None)
+        n += 1
+    return n
+
+
+def merged_base_names(model):
+    """Parameter names of bases that absorbed a merge and must be checkpointed."""
+    out = set()
+    for name, mod in model.named_modules():
+        if isinstance(mod, LoRALinear) and getattr(mod, "merged", False):
+            out.add(f"{name}.base.weight")
+    return out
+
+
 def trainable_parameters(model):
     return [p for p in model.parameters() if p.requires_grad]
 

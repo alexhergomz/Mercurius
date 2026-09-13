@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Long-context eval, then Stage D once it completes.
 set -u
-cd /home/srdelam/qwen-surgery
+cd "$(dirname "$0")/.."
 source env.sh
 
 echo "=== [1/2] long-context NIAH ==="

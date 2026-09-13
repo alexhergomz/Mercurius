@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -u
-cd /home/srdelam/qwen-surgery
+cd "$(dirname "$0")/.."
 source env.sh
 # wait for the in-flight MLA recovery run, by PID (no pattern matching -- a
 # -f match would catch this script's own command line)
