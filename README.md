@@ -108,30 +108,14 @@ follow from that:
   no longer fits.
 - Writes refuse below 8 GB free. The root filesystem is the only filesystem.
 
-## Results
-
-Measured on Qwen3.5-0.8B after 150 steps, 1.23 M tokens, against the unmodified
-model:
-
-| model | ppl@2048 | ppl@8192 | retr@4k | retr@16k |
-|---|---|---|---|---|
-| Qwen3.5-0.8B | 12.801 | 18.285 | 13.487 | 12.689 |
-| + transKDA + NoPE | 12.501 | 17.428 | 13.811 | 13.539 |
-| + transKDA + NoPE + 4x KV | 12.581 | 17.440 | 13.684 | 12.823 |
-
-Both converted rows have seen 1.23 M tokens of distillation and the base model
-has seen none, so the comparison includes that adaptation. The claim supported
-by the numbers is parity at 4x smaller KV cache after 0.047 of an epoch, not
-that surgery improves a model.
-
-Against a control trained identically but left uncompressed, the cost of 4x KV
-compression falls from +17.2% ppl@8192 before recovery to +0.05% after.
-
 ## Status
 
+Work in progress. Nothing here is settled.
+
 No run has reached convergence. Every run so far ended on wall-clock with the
-loss still falling. The vision tower is intact in the original checkpoint but is
-dropped at load; reattaching it is not written.
+loss still falling. The adaptation surface is under revision. The vision tower
+is intact in the original checkpoint but is dropped at load; reattaching it is
+not written.
 
 `docs/findings.md` is the record of what has been measured, what the literature
 says, and what is unproven. It is ordered by confidence and includes a section
