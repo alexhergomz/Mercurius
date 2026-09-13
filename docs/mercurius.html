@@ -244,7 +244,7 @@
   <section>
     <div class="eyebrow">What it is</div>
     <h2>Surgery, not pretraining</h2>
-    <p class="lede">Mercurius is a family of models derived from Qwen3.5 by editing the architecture of the trained weights, then adapting them back to health. Nothing is trained from scratch. The bet is that the expensive part of a good model is the knowledge already in it, and the cheap part is the shape it is served in — so you can change the shape and buy back the quality for a fraction of what pretraining costs.</p>
+    <p class="lede">Mercurius is a family of models derived from Qwen3.5 by editing the architecture of the trained weights, then repairing them by distillation. Nothing is trained from scratch. The premise is that the expensive part of a good model is the knowledge already in it, and the cheap part is the shape it is served in — so you can change the shape and buy back the quality for a fraction of what pretraining costs.</p>
     <p>Every number on this page was produced on a single Jetson AGX Orin with 64&nbsp;GB of unified memory. That constraint is the point. If a conversion pipeline only works on a pod of H100s, it is not a pipeline a small lab can run.</p>
     <p>Sizes are named by parameter count — <strong>Mercurius 0.8B</strong>, <strong>Mercurius 9B</strong> — or S/M/L/XL where a rough tier is more useful. Only the 0.8B has been measured; everything below refers to it.</p>
   </section>
