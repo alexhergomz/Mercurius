@@ -114,6 +114,44 @@ def merge_and_restart(model, optimizer=None):
     return n
 
 
+def resize_lora(model, rules, verbose=True):
+    """Give each adapter the rank its rule now asks for, discarding the old one.
+
+    Only safe AFTER merge_and_restart has folded the existing adapters into
+    their bases -- otherwise the delta they carry is thrown away. That ordering
+    is what lets --init-adapters (rank 16 on disk) be combined with a different
+    --kda-rank: load at the rank the checkpoint has, fold it in, then resize.
+    Loading a rank-16 checkpoint into rank-64 adapters fails outright, since
+    strict=False forgives missing keys but not mismatched shapes.
+    """
+    changed = []
+    for name, mod in model.named_modules():
+        if not isinstance(mod, LoRALinear):
+            continue
+        for pat, r in rules:
+            if not name.endswith(pat):
+                continue
+            if r and r != mod.rank:
+                dev, dt = mod.lora_A.device, mod.lora_A.dtype
+                mod.rank = r
+                mod.scale = 1.0                      # alpha = rank convention
+                mod.lora_A = nn.Parameter(torch.zeros(
+                    r, mod.base.in_features, device=dev, dtype=dt))
+                mod.lora_B = nn.Parameter(torch.zeros(
+                    mod.base.out_features, r, device=dev, dtype=dt))
+                nn.init.kaiming_uniform_(mod.lora_A, a=math.sqrt(5))
+                changed.append((name, r))
+            break
+    if verbose and changed:
+        by_r = {}
+        for _, r in changed:
+            by_r[r] = by_r.get(r, 0) + 1
+        print(f"  resized {len(changed)} adapters "
+              f"({', '.join(f'{c}@r{r}' for r, c in sorted(by_r.items()))})",
+              flush=True)
+    return len(changed)
+
+
 def merged_base_names(model):
     """Parameter names of bases that absorbed a merge and must be checkpointed."""
     out = set()

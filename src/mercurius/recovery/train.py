@@ -28,7 +28,7 @@ from mercurius.models.kda import (load_kda_model, enable_state_passing, reset_st
 from mercurius.surgery.norm_fusion import get_trunk
 from mercurius.surgery.rope_dial import install_rope_dial
 from mercurius.adapters.lora import (inject_lora, freeze_base, trainable_parameters,
-                  merge_and_restart, merged_base_names)
+                  merge_and_restart, merged_base_names, resize_lora)
 from mercurius.eval.characterize import perplexity
 from mercurius.eval.suite import ce_and_topk, sample, report, PROMPTS
 import bitsandbytes as bnb
@@ -383,6 +383,20 @@ def main():
     ap.add_argument("--head-chunk", type=int, default=2048,
                     help="positions per lm_head chunk in the cached-KL path; "
                          "bounds peak head memory independently of seq length")
+    ap.add_argument("--relora-warmup", type=int, default=0,
+                    help="steps of LR re-warmup after each ReLoRA merge. The "
+                         "method needs a jagged schedule: a restarted adapter "
+                         "enters at zero, and without re-warmup it meets "
+                         "whatever the anneal has decayed to, so later merges "
+                         "do progressively less. 0 reproduces the first run. "
+                         "Try relora_every//4.")
+    ap.add_argument("--pull-to-init", type=float, default=0.0,
+                    help="decoupled decay toward the PRETRAINED weight rather "
+                         "than toward zero: p -= lr*s*(p - p_init), applied to "
+                         "inherited dense parameters only. MambaPEFT proposes "
+                         "|W - W_pretrain|^2 in place of |W|^2 at ~1e-3. Four "
+                         "arms here peak at step 100-125 and regress by 150, "
+                         "which is the drift this is meant to bound. 0 = off.")
     ap.add_argument("--kda-rank", type=int, default=None,
                     help="override the LoRA rank on the KDA projections "
                          "(in_proj_qkv, in_proj_z, out_proj). Default 16.")
@@ -458,6 +472,18 @@ def main():
 
     # prior adapters load BEFORE conversion so their delta is merged into the
     # factorization rather than discarded by it
+    # Built ONCE and used by BOTH injection sites. When --init-adapters is set,
+    # LoRA is injected early to shape the model for the load; with patterns
+    # matched by endswith, the later call then finds nothing left to wrap and is
+    # a no-op. Any rule change applied only to the later call is therefore
+    # silently discarded -- which is how --kda-rank printed "rank -> 64" and
+    # trained rank 16.
+    rules = LORA_RULES
+    if a.kda_rank:
+        rules = [(p, a.kda_rank if p.startswith("linear_attn.") else r)
+                 for p, r in LORA_RULES]
+        print(f"  KDA projection LoRA rank -> {a.kda_rank}", flush=True)
+
     if a.init_adapters:
         inject_lora(student, LORA_RULES, verbose=False)
         freeze_base(student)
@@ -465,6 +491,11 @@ def main():
         student.load_state_dict({k: v.cuda() for k, v in _sd.items()}, strict=False)
         print(f"  init from {a.init_adapters.split('/')[-1]} "
               f"({len(_sd)} tensors)", flush=True)
+        if a.kda_rank:
+            # fold the loaded rank-16 delta into the bases FIRST, then resize;
+            # otherwise changing the rank silently discards the prior init
+            merge_and_restart(student)
+            resize_lora(student, rules)
 
     mla_latents = []
     if a.mla_energy is not None or a.mla_dc is not None or a.mla_budget is not None:
@@ -493,11 +524,6 @@ def main():
             if sa is not None and hasattr(sa.k_proj, "latent"):
                 mla_latents.append(sa.k_proj.latent)
 
-    rules = LORA_RULES
-    if a.kda_rank:
-        rules = [(p, a.kda_rank if p.startswith('linear_attn.') else r)
-                 for p, r in LORA_RULES]
-        print(f'  KDA projection LoRA rank -> {a.kda_rank}', flush=True)
     inject_lora(student, rules)
     # Substring matching against parameter names. LoRA-wrapped modules expose
     # their frozen base as "<mod>.base.weight", so a module-prefix pattern like
@@ -592,6 +618,21 @@ def main():
     opt = bnb.optim.AdamW8bit(groups, lr=a.lr, betas=(0.9, 0.95), weight_decay=0.0)
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=max_lr, total_steps=a.steps, pct_start=0.05)
+
+    # Pull-to-init needs the pretrained value of every inherited dense weight.
+    # Adapters are EXCLUDED: their "init" is kaiming/zeros, not a pretrained
+    # operator, so pulling them back is ordinary weight decay and not what this
+    # is for. Snapshot in bf16 alongside the weights -- ~0.56 GB at 280 M dense.
+    last_merge = 0
+    pull_ref = []
+    if a.pull_to_init > 0:
+        skip = ("lora_A", "lora_B", "a_lora_A", "a_lora_B", "ls_lambda")
+        for nm, prm in student.named_parameters():
+            if prm.requires_grad and not any(k in nm for k in skip):
+                pull_ref.append((prm, prm.detach().clone()))
+        mb = sum(r.numel() * r.element_size() for _, r in pull_ref) / 1e9
+        print(f"  pull-to-init {a.pull_to_init:g} on {len(pull_ref)} inherited "
+              f"tensors ({mb:.2f} GB reference copy)", flush=True)
 
     hist = {"loss": [], "eval": []}
 
@@ -825,8 +866,20 @@ def main():
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
+        if a.relora_every and a.relora_warmup:
+            since = step - last_merge
+            if 0 <= since < a.relora_warmup:
+                scale = max(since, 1) / a.relora_warmup
+                for g in opt.param_groups:
+                    g["lr"] *= scale
+        if pull_ref:
+            lr_now = sched.get_last_lr()[0]
+            with torch.no_grad():
+                for prm, ref in pull_ref:
+                    prm.data.lerp_(ref, lr_now * a.pull_to_init)
         if a.relora_every and step > 0 and step % a.relora_every == 0:
             nm = merge_and_restart(student, opt)
+            last_merge = step
             print(f'  [relora] merged and restarted {nm} adapters at step '
                   f'{step} (merge {step//a.relora_every})', flush=True)
         if a.state_passing:

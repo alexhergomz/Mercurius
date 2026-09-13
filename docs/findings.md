@@ -1,4 +1,4 @@
-# Mercurius findings log
+# Carmenta findings log
 
 Running record of what we have **measured**, what the **literature** says, and what
 is still **unproven**. Entries carry the run tag or citation so any claim can be
