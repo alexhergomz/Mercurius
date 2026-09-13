@@ -1,0 +1,534 @@
+<title>Mercurius</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&display=swap">
+<style>
+  :root {
+    --plane:      #F1F3F2;
+    --surface:    #FBFCFB;
+    --ink:        #121A19;
+    --ink-2:      #4E5A58;
+    --accent:     #005A62;
+    --accent-soft:#E2EDEC;
+    --good:       #006300;
+    --bad:        #B02418;
+    --s1:         #00909B;
+    --s2:         #C2410C;
+    --rule:       #D8DEDC;
+    --grid:       #E3E8E6;
+    --axis:       #C5CDCB;
+    --shadow:     0 1px 2px rgba(18,26,25,.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --plane:      #0C1211;
+      --surface:    #161D1C;
+      --ink:        #E7EDEB;
+      --ink-2:      #A9B6B3;
+      --accent:     #3FBAC2;
+      --accent-soft:#17302F;
+      --good:       #3DBF5C;
+      --bad:        #F0776A;
+      --s1:         #12A3AB;
+      --s2:         #D95926;
+      --rule:       #26302E;
+      --grid:       #222B2A;
+      --axis:       #333F3D;
+      --shadow:     0 1px 2px rgba(0,0,0,.4);
+    }
+  }
+  :root[data-theme="dark"] {
+    --plane:      #0C1211;
+    --surface:    #161D1C;
+    --ink:        #E7EDEB;
+    --ink-2:      #A9B6B3;
+    --accent:     #3FBAC2;
+    --accent-soft:#17302F;
+    --good:       #3DBF5C;
+    --bad:        #F0776A;
+    --s1:         #12A3AB;
+    --s2:         #D95926;
+    --rule:       #26302E;
+    --grid:       #222B2A;
+    --axis:       #333F3D;
+    --shadow:     0 1px 2px rgba(0,0,0,.4);
+  }
+
+  body {
+    background: var(--plane);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page {
+    max-width: 960px;
+    margin-inline: auto;
+    padding-inline: 28px;
+    padding-block: 0 72px;
+  }
+  @media (max-width: 560px) { .page { padding-inline: 16px; } }
+
+  a { color: var(--accent); text-underline-offset: 3px; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11px; font-weight: 500;
+    letter-spacing: .13em; text-transform: uppercase;
+    color: var(--accent);
+  }
+
+  /* ---------- masthead ---------- */
+  .mast { padding-block: 56px 32px; border-bottom: 1px solid var(--rule); }
+  .wordmark {
+    font-family: Newsreader, Georgia, serif;
+    font-size: clamp(52px, 13vw, 88px);
+    font-weight: 500; line-height: .95; letter-spacing: -.015em;
+    margin: 10px 0 0; text-wrap: balance;
+  }
+  .standfirst {
+    font-family: Newsreader, Georgia, serif;
+    font-size: clamp(19px, 2.6vw, 24px);
+    line-height: 1.45; color: var(--ink-2);
+    max-width: 40ch; margin: 18px 0 0;
+  }
+  .meta {
+    display: flex; flex-wrap: wrap; gap: 0 36px;
+    margin-top: 30px; padding-top: 22px; border-top: 1px solid var(--rule);
+  }
+  .meta div { padding-block: 6px; }
+  .meta dt {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 10.5px; letter-spacing: .11em; text-transform: uppercase;
+    color: var(--ink-2); margin-bottom: 3px;
+  }
+  .meta dd { margin: 0; font-size: 14.5px; font-weight: 500; }
+
+  /* ---------- sections ---------- */
+  section { padding-block: 46px; border-bottom: 1px solid var(--rule); }
+  section:last-of-type { border-bottom: 0; }
+  h2 {
+    font-family: Newsreader, Georgia, serif;
+    font-size: clamp(27px, 4vw, 35px); font-weight: 500;
+    line-height: 1.2; letter-spacing: -.01em;
+    margin: 8px 0 18px; text-wrap: balance;
+  }
+  h3 {
+    font-size: 15.5px; font-weight: 600; margin: 0 0 6px;
+    letter-spacing: -.005em;
+  }
+  p { max-width: 68ch; margin: 0 0 16px; }
+  p:last-child { margin-bottom: 0; }
+  .lede { font-size: 17.5px; }
+
+  code, .num {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+  code { font-size: .88em; background: var(--accent-soft); padding: 1px 5px; border-radius: 3px; }
+  .up   { color: var(--bad);  font-variant-numeric: tabular-nums; }
+  .down { color: var(--good); font-variant-numeric: tabular-nums; }
+
+  /* ---------- stage list ---------- */
+  .stages { display: grid; gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 4px; overflow: hidden; }
+  .stage { background: var(--surface); padding: 22px 24px; display: grid; grid-template-columns: 58px 1fr; gap: 20px; align-items: start; }
+  @media (max-width: 560px) { .stage { grid-template-columns: 1fr; gap: 10px; padding: 20px 18px; } }
+  .stage-key {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11px; font-weight: 500; letter-spacing: .08em;
+    color: var(--accent); padding-top: 3px;
+  }
+  .stage p { font-size: 14.5px; margin-bottom: 10px; color: var(--ink-2); max-width: 62ch; }
+  .verdict {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 12.5px; font-variant-numeric: tabular-nums;
+    display: inline-flex; align-items: baseline; gap: 8px;
+    padding: 4px 10px; border-radius: 3px; background: var(--accent-soft); color: var(--ink);
+  }
+
+  /* ---------- layer strip ---------- */
+  .strip-wrap { overflow-x: auto; padding-block: 4px 2px; }
+  .strip { display: flex; gap: 3px; min-width: 300px; }
+  .strip span { flex: 1 1 0; min-width: 8px; height: 38px; border-radius: 2px; background: var(--grid); }
+  .strip span.att { background: var(--s1); }
+  .strip-legend { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 12px; font-size: 13px; color: var(--ink-2); }
+  .key { display: inline-flex; align-items: center; gap: 8px; }
+  .key i { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+  .key i.att { background: var(--s1); }
+  .key i.lin { background: var(--grid); }
+
+  /* ---------- chart ---------- */
+  .chart-card { background: var(--surface); border: 1px solid var(--rule); border-radius: 4px; padding: 22px 24px 16px; box-shadow: var(--shadow); }
+  @media (max-width: 560px) { .chart-card { padding: 18px 14px 12px; } }
+  .chart-card h3 { font-size: 16.5px; }
+  .chart-card .sub { font-size: 13.5px; color: var(--ink-2); max-width: 62ch; margin: 0 0 14px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px 24px; margin-bottom: 8px; }
+  .lk { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); }
+  .chart-scroll { position: relative; overflow-x: auto; }
+  .chart-scroll svg { display: block; min-width: 460px; width: 100%; height: auto; }
+  .hit { fill: transparent; cursor: pointer; }
+  .tip {
+    position: absolute; transform: translate(-50%, -118%);
+    background: var(--surface); border: 1px solid var(--rule);
+    border-radius: 4px; padding: 8px 11px; pointer-events: none;
+    box-shadow: 0 3px 12px rgba(0,0,0,.13); white-space: nowrap; z-index: 5;
+  }
+  .tip-val { font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; font-size: 15px; font-weight: 500; color: var(--ink); display: block; }
+  .tip-row { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--ink-2); margin-top: 3px; }
+  .tip-key { width: 14px; height: 2px; border-radius: 1px; display: inline-block; }
+  .tip-key.s1 { background: var(--s1); }
+  .tip-key.s2 { background: var(--s2); }
+
+  /* ---------- tables ---------- */
+  .table-wrap { overflow-x: auto; margin-top: 22px; }
+  table { border-collapse: collapse; width: 100%; min-width: 440px; font-size: 14px; }
+  caption { text-align: left; font-size: 13px; color: var(--ink-2); padding-bottom: 10px; }
+  th, td { padding: 9px 14px 9px 0; text-align: right; border-bottom: 1px solid var(--rule); }
+  th:first-child, td:first-child { text-align: left; }
+  thead th {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 10.5px; font-weight: 500; letter-spacing: .09em; text-transform: uppercase;
+    color: var(--ink-2); border-bottom-color: var(--axis);
+  }
+  tbody td { font-variant-numeric: tabular-nums; font-family: "IBM Plex Mono", ui-monospace, monospace; }
+  tbody tr:last-child td { border-bottom: 0; }
+
+  /* ---------- findings ---------- */
+  .findings { display: grid; gap: 18px; margin-top: 6px; }
+  .finding { border-left: 2px solid var(--s2); padding: 2px 0 2px 18px; }
+  .finding.ok { border-left-color: var(--s1); }
+  .finding h3 { margin-bottom: 4px; }
+  .finding p { font-size: 14.5px; color: var(--ink-2); margin-bottom: 0; }
+
+  /* ---------- repro ---------- */
+  pre {
+    background: var(--surface); border: 1px solid var(--rule); border-radius: 4px;
+    padding: 18px 20px; overflow-x: auto; font-size: 13px; line-height: 1.75;
+    font-family: "IBM Plex Mono", ui-monospace, monospace; margin: 0;
+  }
+  pre .c { color: var(--ink-2); }
+  pre b { color: var(--accent); font-weight: 500; }
+
+  .roadmap { list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; }
+  .roadmap li { display: grid; grid-template-columns: 96px 1fr; gap: 18px; font-size: 14.5px; align-items: baseline; }
+  @media (max-width: 560px) { .roadmap li { grid-template-columns: 1fr; gap: 3px; } }
+  .roadmap .st {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase; color: var(--ink-2);
+  }
+  .roadmap p { margin: 0; color: var(--ink-2); }
+  .roadmap strong { color: var(--ink); font-weight: 600; }
+
+  footer { padding-block: 40px 0; border-top: 1px solid var(--rule); margin-top: 8px; }
+  footer p { font-size: 13.5px; color: var(--ink-2); }
+
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<div class="page">
+
+  <header class="mast">
+    <div class="eyebrow">Model family · 0.8B measured</div>
+    <h1 class="wordmark">Mercurius</h1>
+    <p class="standfirst">A strong open model, cut into a cheaper shape and sewn back up — on one 64&nbsp;GB Jetson, start to finish.</p>
+    <dl class="meta">
+      <div><dt>Base</dt><dd>Qwen3.5 0.8B</dd></div>
+      <div><dt>Hardware</dt><dd>Jetson AGX Orin 64&nbsp;GB</dd></div>
+      <div><dt>Sizes</dt><dd>0.8B · 9B planned</dd></div>
+      <div><dt>Status</dt><dd>Recovery measured</dd></div>
+    </dl>
+  </header>
+
+  <section>
+    <div class="eyebrow">What it is</div>
+    <h2>Surgery, not pretraining</h2>
+    <p class="lede">Mercurius is a family of models derived from Qwen3.5 by editing the architecture of the trained weights, then adapting them back to health. Nothing is trained from scratch. The bet is that the expensive part of a good model is the knowledge already in it, and the cheap part is the shape it is served in — so you can change the shape and buy back the quality for a fraction of what pretraining costs.</p>
+    <p>Every number on this page was produced on a single Jetson AGX Orin with 64&nbsp;GB of unified memory. That constraint is the point. If a conversion pipeline only works on a pod of H100s, it is not a pipeline a small lab can run.</p>
+    <p>Sizes are named by parameter count — <strong>Mercurius 0.8B</strong>, <strong>Mercurius 9B</strong> — or S/M/L/XL where a rough tier is more useful. Only the 0.8B has been measured; everything below refers to it.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">Where the KV cache lives</div>
+    <h2>Six layers out of twenty-four</h2>
+    <p>Qwen3.5 is already a hybrid: eight repeats of three GatedDeltaNet (linear-attention) blocks followed by one full GatedAttention block. Only those six full-attention layers hold a KV cache at all — at indices 3, 7, 11, 15, 19 and 23.</p>
+    <div class="strip-wrap">
+      <div class="strip" aria-hidden="true">
+        <span></span><span></span><span></span><span class="att"></span>
+        <span></span><span></span><span></span><span class="att"></span>
+        <span></span><span></span><span></span><span class="att"></span>
+        <span></span><span></span><span></span><span class="att"></span>
+        <span></span><span></span><span></span><span class="att"></span>
+        <span></span><span></span><span></span><span class="att"></span>
+      </div>
+    </div>
+    <div class="strip-legend">
+      <span class="key"><i class="lin"></i>18 × GatedDeltaNet — linear, no cache</span>
+      <span class="key"><i class="att"></i>6 × GatedAttention — full, KV-cached</span>
+    </div>
+    <p style="margin-top:18px">This bounds the prize honestly. The hybrid has already removed most of the cache a dense 24-layer transformer would carry, so compressing what remains is architectural alignment more than a dramatic memory win. We report it as such.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">The pipeline</div>
+    <h2>Four stages, and what each one cost</h2>
+    <p>Each stage runs on the output of the last, at full precision, before any quantization. Stages are gated: a conversion that claims to be exact has to prove it against a matched perturbation control before anything downstream is measured.</p>
+
+    <div class="stages">
+      <div class="stage">
+        <div class="stage-key">A · B</div>
+        <div>
+          <h3>Norm fusion, then GatedDeltaNet → KDA</h3>
+          <p>RMSNorm gains are folded into the weights of every consumer projection, and the linear-attention blocks are lifted to Kimi Delta Attention by tiling the scalar decay parameter into a diagonal — the tiled initialization reproduces the original mapping exactly, so the richer parameterization starts as a no-op.</p>
+          <span class="verdict"><span class="down">bit-exact</span> verified against the unmodified model</span>
+        </div>
+      </div>
+      <div class="stage">
+        <div class="stage-key">C</div>
+        <div>
+          <h3>NoPE — every RoPE frequency identity-ized</h3>
+          <p>Rotary position encoding is switched off by driving all frequencies to identity, which changes no weights. The thesis is that the KDA layers carry position well enough on their own. It is the one stage that costs real quality up front.</p>
+          <span class="verdict"><span class="up">+12.70%</span> ppl at surgery → <span class="up">+0.65%</span> after 2.46M tokens</span>
+        </div>
+      </div>
+      <div class="stage">
+        <div class="stage-key">D</div>
+        <div>
+          <h3>TransMLA — a shared low-rank KV latent</h3>
+          <p>K and V on the six attention layers are replaced by one joint latent, balanced before factorization so the rank budget is not spent on whichever matrix is larger. The factorization is done in the whitened basis (CARE), which optimizes activation error rather than weight error.</p>
+          <span class="verdict">4.00× KV for <span class="up">+8.40%</span> before recovery, <span class="up">+4.8%</span> after</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow">Stage D in detail</div>
+    <h2>Whitening changes what compression costs</h2>
+    <p>Plain SVD minimizes <code>‖W − Ŵ‖</code>. That is the wrong objective — what the model experiences is <code>‖XW − XŴ‖</code>. Whitening by the calibration covariance before truncating optimizes the error the model actually sees. The gap between the two is small at mild compression and enormous at aggressive compression.</p>
+
+    <div class="chart-card">
+      <h3>Cost of KV compression, before recovery</h3>
+      <p class="sub">Perplexity change at 2,048 tokens against the uncompressed Mercurius 0.8B baseline of 12.360. Lower is better; the 0% line is free compression.</p>
+      <div class="legend">
+        <span class="lk"><svg width="18" height="8" aria-hidden="true"><line x1="1" y1="4" x2="17" y2="4" stroke="var(--s2)" stroke-width="2" stroke-linecap="round"></line></svg>Plain SVD</span>
+        <span class="lk"><svg width="18" height="8" aria-hidden="true"><line x1="1" y1="4" x2="17" y2="4" stroke="var(--s1)" stroke-width="2" stroke-linecap="round"></line></svg>CARE whitened</span>
+      </div>
+      <div class="chart-scroll" id="kvchart">
+        <svg viewBox="0 0 720 344" role="img" aria-label="Line chart: perplexity cost against KV compression. Plain SVD rises from +0.66% at 1.40x to +35.16% at 4.00x. CARE whitened rises from -0.14% to +8.40% over the same range.">
+          <!-- gridlines -->
+          <line x1="56" y1="66.3"  x2="616" y2="66.3"  stroke="var(--grid)" stroke-width="1"></line>
+          <line x1="56" y1="136.8" x2="616" y2="136.8" stroke="var(--grid)" stroke-width="1"></line>
+          <line x1="56" y1="207.4" x2="616" y2="207.4" stroke="var(--grid)" stroke-width="1"></line>
+          <!-- zero line: free compression -->
+          <line x1="56" y1="277.9" x2="616" y2="277.9" stroke="var(--axis)" stroke-width="1"></line>
+          <!-- y ticks -->
+          <text x="46" y="70"    text-anchor="end" fill="var(--ink-2)" font-size="11.5" font-family="IBM Plex Mono, monospace">+30%</text>
+          <text x="46" y="140.6" text-anchor="end" fill="var(--ink-2)" font-size="11.5" font-family="IBM Plex Mono, monospace">+20%</text>
+          <text x="46" y="211.2" text-anchor="end" fill="var(--ink-2)" font-size="11.5" font-family="IBM Plex Mono, monospace">+10%</text>
+          <text x="46" y="281.7" text-anchor="end" fill="var(--ink-2)" font-size="11.5" font-family="IBM Plex Mono, monospace">0%</text>
+          <!-- baseline axis -->
+          <line x1="56" y1="292" x2="616" y2="292" stroke="var(--axis)" stroke-width="1"></line>
+          <!-- series: plain SVD -->
+          <path d="M64,273.24 L188.6,247 L327.8,194.89 L604,29.92" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"></path>
+          <!-- series: CARE -->
+          <path d="M64,278.88 L188.6,274.93 L327.8,251.59 L604,218.65" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"></path>
+          <!-- markers -->
+          <circle cx="64"    cy="273.24" r="5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"></circle>
+          <circle cx="188.6" cy="247"    r="5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"></circle>
+          <circle cx="327.8" cy="194.89" r="5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"></circle>
+          <circle cx="604"   cy="29.92"  r="5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"></circle>
+          <circle cx="64"    cy="278.88" r="5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"></circle>
+          <circle cx="188.6" cy="274.93" r="5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"></circle>
+          <circle cx="327.8" cy="251.59" r="5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"></circle>
+          <circle cx="604"   cy="218.65" r="5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"></circle>
+          <!-- endpoint direct labels -->
+          <text x="616" y="34"     fill="var(--ink)"   font-size="12.5" font-weight="500" font-family="IBM Plex Mono, monospace">+35.16%</text>
+          <text x="616" y="222.8"  fill="var(--ink)"   font-size="12.5" font-weight="500" font-family="IBM Plex Mono, monospace">+8.40%</text>
+          <!-- x ticks -->
+          <text x="64"    y="311" text-anchor="middle" fill="var(--ink-2)" font-size="11.5" font-family="IBM Plex Mono, monospace">1.40×</text>
+          <text x="188.6" y="311" text-anchor="middle" fill="var(--ink-2)" font-size="11.5" font-family="IBM Plex Mono, monospace">2.00×</text>
+          <text x="327.8" y="311" text-anchor="middle" fill="var(--ink-2)" font-size="11.5" font-family="IBM Plex Mono, monospace">2.67×</text>
+          <text x="604"   y="311" text-anchor="middle" fill="var(--ink-2)" font-size="11.5" font-family="IBM Plex Mono, monospace">4.00×</text>
+          <text x="336"   y="336" text-anchor="middle" fill="var(--ink-2)" font-size="12" font-family="IBM Plex Sans, sans-serif">KV cache compression</text>
+          <!-- hit targets -->
+          <circle class="hit" cx="64"    cy="273.24" r="17" tabindex="0" data-val="+0.66%"  data-ser="s2" data-series="Plain SVD"     data-x="1.40× KV · d_c 729"></circle>
+          <circle class="hit" cx="188.6" cy="247"    r="17" tabindex="0" data-val="+4.38%"  data-ser="s2" data-series="Plain SVD"     data-x="2.00× KV · d_c 512"></circle>
+          <circle class="hit" cx="327.8" cy="194.89" r="17" tabindex="0" data-val="+11.77%" data-ser="s2" data-series="Plain SVD"     data-x="2.67× KV · d_c 384"></circle>
+          <circle class="hit" cx="604"   cy="29.92"  r="17" tabindex="0" data-val="+35.16%" data-ser="s2" data-series="Plain SVD"     data-x="4.00× KV · d_c 256"></circle>
+          <circle class="hit" cx="64"    cy="278.88" r="17" tabindex="0" data-val="−0.14%"  data-ser="s1" data-series="CARE whitened" data-x="1.40× KV · d_c 729"></circle>
+          <circle class="hit" cx="188.6" cy="274.93" r="17" tabindex="0" data-val="+0.42%"  data-ser="s1" data-series="CARE whitened" data-x="2.00× KV · d_c 512"></circle>
+          <circle class="hit" cx="327.8" cy="251.59" r="17" tabindex="0" data-val="+3.73%"  data-ser="s1" data-series="CARE whitened" data-x="2.67× KV · d_c 384"></circle>
+          <circle class="hit" cx="604"   cy="218.65" r="17" tabindex="0" data-val="+8.40%"  data-ser="s1" data-series="CARE whitened" data-x="4.00× KV · d_c 256"></circle>
+        </svg>
+        <div class="tip" id="kvtip" hidden>
+          <span class="tip-val"></span>
+          <span class="tip-row"><i class="tip-key"></i><span class="tip-ser"></span></span>
+          <span class="tip-row tip-x"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Perplexity at 2,048 tokens against the 12.360 baseline. Measured before any recovery training.</caption>
+        <thead>
+          <tr><th>Latent d_c</th><th>KV cache</th><th>Plain SVD</th><th>CARE whitened</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>729</td><td>1.40×</td><td class="up">+0.66%</td><td class="down">−0.14%</td></tr>
+          <tr><td>512</td><td>2.00×</td><td class="up">+4.38%</td><td class="up">+0.42%</td></tr>
+          <tr><td>384</td><td>2.67×</td><td class="up">+11.77%</td><td class="up">+3.73%</td></tr>
+          <tr><td>256</td><td>4.00×</td><td class="up">+35.16%</td><td class="up">+8.40%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:20px">At 1.40× the whitened factorization is marginally <em>better</em> than the model it compresses, which is a rounding-level result and should be read as "free", not as an improvement. At 4.00× whitening is worth roughly 26.8 percentage points of perplexity.</p>
+    <p><strong>Recovery has now run, measured against a matched control.</strong> Comparing the compressed model to the uncompressed baseline overstates the result badly, because recovery training improves the model for reasons unrelated to compression. So a second arm was trained — identical data, identical 150-step schedule, <em>no compression</em> — and subtracted. Its step-0 perplexity reproduces the baseline exactly (12.360 / 17.384), which is what makes the two arms comparable.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>4.00× KV compression against a matched uncompressed control. The delta is the true cost.</caption>
+        <thead>
+          <tr><th>Step</th><th>Length</th><th>4× KV</th><th>Control</th><th>True cost</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>0</td><td>2,048</td><td class="up">+8.40%</td><td>+0.00%</td><td class="up">+8.40%</td></tr>
+          <tr><td>0</td><td>8,192</td><td class="up">+17.10%</td><td>+0.00%</td><td class="up">+17.10%</td></tr>
+          <tr><td>50</td><td>2,048</td><td>+0.53%</td><td class="down">−4.87%</td><td class="up">+5.67%</td></tr>
+          <tr><td>50</td><td>8,192</td><td class="down">−2.15%</td><td class="down">−6.64%</td><td class="up">+4.81%</td></tr>
+          <tr><td>150</td><td>2,048</td><td>+2.78%</td><td class="down">−1.83%</td><td class="up">+4.69%</td></tr>
+          <tr><td>150</td><td>8,192</td><td>+1.89%</td><td class="down">−2.78%</td><td class="up">+4.81%</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p style="margin-top:20px">Read naively, the compressed model looks <em>better than baseline</em> at 8k (<span class="down">−2.15%</span>). It is not. The control reached <span class="down">−6.64%</span> with no compression at all, so the true cost of 4× KV at matched training is about <strong>+4.8%</strong>. Recovery does real work — untrained the cost is +8.40% at 2k and +17.10% at 8k — but it plateaus near +5% rather than closing.</p>
+    <p>The delta is also far steadier than either arm alone. Each absolute number swings by several points between checkpoints while the difference stays within 4.69–5.67%, so whatever drives the swing — learning-rate schedule, drift toward the training distribution — affects both arms equally and cancels. The earlier "roughly free" reading was an artifact of comparing against a baseline that never received the same training.</p>
+    <p>That ~5% perplexity figure is <strong>robust</strong>. It does not move across LoRA versus dense training, 12M versus 294M trainable parameters, 150 versus 400 steps, or 1M versus 5M cached distillation tokens. Four independent attempts to spend it down land in the same band, which reads as an information floor at this rank rather than a training shortfall.</p>
+
+    <h3 style="margin-top:30px">Perplexity understates this badly</h3>
+    <p>Quoting ~5% as <em>the</em> cost of 4× KV would be misleading, and we did so in an earlier version of this page. Measured against the same matched control, retrieval degrades far faster — and the gap grows with distance.</p>
+    <div class="table-wrap">
+      <table>
+        <caption>4.00× KV compression against its matched uncompressed control, same data and schedule. Retrieval gain: higher is better, so the cost is the drop.</caption>
+        <thead>
+          <tr><th>Metric</th><th>4× KV</th><th>Control</th><th>Cost</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>perplexity @ 2,048</td><td>12.945</td><td>12.335</td><td class="up">+4.94%</td></tr>
+          <tr><td>perplexity @ 8,192</td><td>17.262</td><td>16.472</td><td class="up">+4.79%</td></tr>
+          <tr><td>retrieval, gap 256</td><td>12.029</td><td>12.454</td><td class="up">−3.41%</td></tr>
+          <tr><td>retrieval, gap 1,024</td><td>11.466</td><td>12.267</td><td class="up">−6.53%</td></tr>
+          <tr><td>retrieval, gap 4,096</td><td>9.978</td><td>12.068</td><td class="up">−17.32%</td></tr>
+          <tr><td>retrieval, gap 16,384</td><td>7.730</td><td>11.104</td><td class="up">−30.39%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:20px">At a 16k gap the compression costs <strong>30.4% of retrieval — six times its perplexity cost</strong>, and the degradation is monotonic in distance. In hindsight the mechanism is obvious: the KV cache <em>is</em> the long-range retrieval path, so quartering its rank destroys distant-key discrimination while barely touching next-token prediction, which is dominated by local context. Perplexity was structurally the wrong instrument for this stage.</p>
+    <p><strong>The honest summary: 4× KV cache costs about 5% perplexity and about 30% of long-range retrieval.</strong> If your workload is generation over short contexts, the first number is the relevant one. If it involves retrieving from far back in a long context, the second one is, and 4× is probably too aggressive — the CARE table above shows 2.00× at +0.42% perplexity before any recovery, which is where a retrieval-sensitive deployment should start.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">Honest failures</div>
+    <h2>What is still broken</h2>
+    <div class="findings">
+      <div class="finding">
+        <h3>NoPE fails on late-placed needles — not on long ones</h3>
+        <p>At 131k tokens with the needle at depth 0.9, NoPE scores a retrieval gain of 4.809 against 11.237 for the RoPE-keeping control — 43% of the control, with untrained NoPE at 0.188. The obvious reading is that NoPE runs out of range, and the full depth×length grid says that reading is wrong. Because the scored copy sits at the end of the sequence, depth sets the <em>gap</em> between the two copies: depth 0.9 is a 13k lookback, depth 0.1 a 118k one. At depth 0.1 NoPE reaches <span class="num">1.011</span>–<span class="num">1.090</span>× the control across 32k, 65k and 131k — parity or better at the <em>longest</em> gaps. The deficit is confined to needles placed late in the context, which points at a missing recency signal rather than exhausted range, and changes which fixes are worth trying.</p>
+      </div>
+      <div class="finding">
+        <h3>A third of the NoPE headline was not NoPE</h3>
+        <p>The +12.70% → +0.65% recovery looks better than it is. A matched control arm that kept RoPE and trained on the same data closed roughly a third of that distance on its own. The honest reading is that NoPE recovery is real but two-thirds the size of the raw before-and-after, and we would not have known without running the control.</p>
+      </div>
+      <div class="finding">
+        <h3>Vision is untested</h3>
+        <p>The vision tower is excluded from every measurement here. It was left out deliberately to keep the first pass tractable, and its capabilities may well have degraded. Nothing on this page should be read as a claim about multimodal behavior.</p>
+      </div>
+      <div class="finding ok">
+        <h3>Initialization dominates training</h3>
+        <p>Three results worth carrying forward: seeding the KDA decay gates moves them about 30× further than the entire training run does; a decay target of α ≈ 0.60 outperformed the 0.47 taken from prior work; and initializing the gates to exactly reproduce GatedDeltaNet — the intuitively safest choice — was the <em>worst</em> configuration for long context. Where you start matters more than how long you train.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow">Reproduce</div>
+    <h2>The whole pipeline, one device</h2>
+    <p>Every stage is gated and every gate is measured against a control. Running these in order rebuilds the model on this page.</p>
+    <pre><span class="c"># fuse norms, lift GatedDeltaNet → KDA — asserts bit-exactness</span>
+python src/<b>build_stage_ab.py</b>
+
+<span class="c"># calibrate activation covariances, compare plain SVD against whitened</span>
+python src/<b>run_care.py</b>
+
+<span class="c"># latent-KV sweep, with a full-rank no-op check before any lossy rank</span>
+python src/<b>run_stage_d.py</b>
+
+<span class="c"># save the calibration covariances the whitened factorization needs</span>
+python src/<b>save_covs.py</b>
+
+<span class="c"># recovery: NoPE + whitened latent KV at 4× cache, distilled against
+# a cached top-k teacher. --mla-covs is required, not optional: without
+# it the run refuses outright rather than quietly falling back to the
+# plain-SVD factorization, which is far worse at this rank.</span>
+python src/<b>train_recovery.py</b> --dial nope --mla-dc 256 \
+    --mla-covs cache/kv_covs.pt \
+    --logit-cache cache/tk64_1m.pt --topk 64 --length-mix
+
+<span class="c"># needle-in-a-haystack across depth × length</span>
+python src/<b>eval_longctx.py</b></pre>
+    <p style="margin-top:20px">Training is distilled against a pre-computed top-k logit cache, so the teacher never runs during the loop — which is what makes recovery affordable on one device. Sequence lengths are sampled from a mixture rather than fixed, putting long-context gradient signal into the run at about a fifth of the cost of training at full length throughout.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">Roadmap</div>
+    <h2>What comes next</h2>
+    <ul class="roadmap">
+      <li><span class="st">Done</span><p><strong>Recovery on the compressed model, with a control.</strong> 4× KV costs about +5% perplexity at matched training — roughly half the untrained damage at 2k and a quarter of it at 8k, but it plateaus rather than closing.</p></li>
+      <li><span class="st">Next</span><p><strong>Retrieval on the compressed model.</strong> Every number here is perplexity. The depth×length grid showed perplexity and retrieval moving independently, so the compression result should not be assumed to transfer to needle retrieval until measured.</p></li>
+      <li><span class="st">Next</span><p><strong>Long-range training data.</strong> Targeted repeated-span data aimed squarely at the depth-0.9 retrieval failure, plus multi-needle and multi-seed evaluation for statistical power.</p></li>
+      <li><span class="st">Planned</span><p><strong>Mercurius 9B.</strong> Testing whether the pipeline transfers up a size class unchanged, which is the claim that makes it a family rather than a one-off.</p></li>
+      <li><span class="st">Deferred</span><p><strong>Vision.</strong> Re-attaching and measuring the vision tower once the language-side pipeline is settled.</p></li>
+    </ul>
+  </section>
+
+  <footer>
+    <p>Mercurius is the Roman god of translation and of boundaries — of carrying something across into a new form, and of doing it quickly. These models are Qwen3.5 carried across into a cheaper architecture, not built from nothing. The family name is the only mythological one; sizes are parameter counts.</p>
+  </footer>
+
+</div>
+
+<script>
+  (function () {
+    var wrap = document.getElementById('kvchart');
+    var tip = document.getElementById('kvtip');
+    if (!wrap || !tip) return;
+    var val = tip.querySelector('.tip-val');
+    var ser = tip.querySelector('.tip-ser');
+    var xlb = tip.querySelector('.tip-x');
+    var key = tip.querySelector('.tip-key');
+
+    function show(el) {
+      var r = el.getBoundingClientRect();
+      var w = wrap.getBoundingClientRect();
+      val.textContent = el.dataset.val;
+      ser.textContent = el.dataset.series;
+      xlb.textContent = el.dataset.x;
+      key.className = 'tip-key ' + el.dataset.ser;
+      tip.hidden = false;
+      tip.style.left = (r.left - w.left + wrap.scrollLeft + r.width / 2) + 'px';
+      tip.style.top = (r.top - w.top + r.height / 2) + 'px';
+    }
+    function hide() { tip.hidden = true; }
+
+    Array.prototype.forEach.call(wrap.querySelectorAll('.hit'), function (el) {
+      el.addEventListener('pointerenter', function () { show(el); });
+      el.addEventListener('pointerleave', hide);
+      el.addEventListener('focus', function () { show(el); });
+      el.addEventListener('blur', hide);
+    });
+    wrap.addEventListener('pointerleave', hide);
+  })();
+</script>

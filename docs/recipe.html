@@ -1,0 +1,287 @@
+<title>Mercurius Conversion Recipe</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Source+Sans+3:wght@400;600&family=Spectral:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --paper:#F7F6F3; --surface:#FFFFFF; --sunk:#F0EEE8;
+    --ink:#1A1C1F; --ink-2:#565C63; --ink-3:#8A9099;
+    --rule:#DFDBD3; --accent:#2F5D62; --accent-soft:#E3ECEB;
+    --warn:#8C3A2B; --warn-soft:#F6E7E2;
+    --ok:#3F6B4A; --ok-soft:#E6EFE7;
+    --shadow:0 1px 2px rgba(26,28,31,.07);
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --paper:#14161A; --surface:#1C1F24; --sunk:#191C21;
+      --ink:#E9E7E2; --ink-2:#A8AEB6; --ink-3:#727982;
+      --rule:#2A2E35; --accent:#6FB3B8; --accent-soft:#1B2E30;
+      --warn:#E08B77; --warn-soft:#2E1E1A;
+      --ok:#7FBF8E; --ok-soft:#1B2A1F;
+      --shadow:0 1px 2px rgba(0,0,0,.45);
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#14161A; --surface:#1C1F24; --sunk:#191C21;
+    --ink:#E9E7E2; --ink-2:#A8AEB6; --ink-3:#727982;
+    --rule:#2A2E35; --accent:#6FB3B8; --accent-soft:#1B2E30;
+    --warn:#E08B77; --warn-soft:#2E1E1A;
+    --ok:#7FBF8E; --ok-soft:#1B2A1F;
+    --shadow:0 1px 2px rgba(0,0,0,.45);
+  }
+
+  body{background:var(--paper);color:var(--ink);
+    font-family:"Source Sans 3",system-ui,sans-serif;font-size:16.5px;line-height:1.62;
+    -webkit-font-smoothing:antialiased;}
+  .page{max-width:860px;margin-inline:auto;padding-inline:30px;padding-block:0 76px;}
+  @media (max-width:560px){.page{padding-inline:16px;}}
+  a{color:var(--accent);}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:2px;}
+  code,.mono,.num{font-family:"JetBrains Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums;}
+  code{font-size:.86em;background:var(--sunk);padding:1px 5px;border-radius:3px;}
+
+  header{padding-block:52px 26px;border-bottom:2px solid var(--ink);}
+  .eyebrow{font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:.14em;
+    text-transform:uppercase;color:var(--accent);}
+  h1{font-family:Spectral,Georgia,serif;font-size:clamp(36px,6.5vw,54px);font-weight:600;
+    line-height:1.06;letter-spacing:-.015em;margin:10px 0 0;text-wrap:balance;}
+  .sub{font-family:Spectral,Georgia,serif;font-size:clamp(17px,2.3vw,20px);color:var(--ink-2);
+    max-width:52ch;margin:14px 0 0;line-height:1.45;}
+  .facts{display:flex;flex-wrap:wrap;gap:0 34px;margin-top:26px;}
+  .facts div{padding-block:5px;}
+  .facts dt{font-family:"JetBrains Mono",monospace;font-size:10px;letter-spacing:.11em;
+    text-transform:uppercase;color:var(--ink-3);margin-bottom:2px;}
+  .facts dd{margin:0;font-size:14.5px;font-weight:600;}
+
+  h2{font-family:Spectral,Georgia,serif;font-size:clamp(25px,3.6vw,31px);font-weight:600;
+    line-height:1.2;margin:52px 0 6px;text-wrap:balance;}
+  h3{font-size:15.5px;font-weight:600;margin:26px 0 6px;letter-spacing:-.005em;}
+  p{max-width:68ch;margin:0 0 14px;}
+  p:last-child{margin-bottom:0;}
+  .lede{font-size:17.5px;color:var(--ink-2);}
+
+  /* stage rail -- A/B/C/D is a real dependency chain, not decoration */
+  .stage{display:grid;grid-template-columns:46px 1fr;gap:22px;padding-block:24px;
+    border-top:1px solid var(--rule);}
+  .stage:first-of-type{border-top:0;}
+  @media (max-width:560px){.stage{grid-template-columns:1fr;gap:8px;}}
+  .stage-key{font-family:Spectral,serif;font-size:30px;font-weight:600;color:var(--accent);
+    line-height:1;padding-top:2px;}
+  .stage p{font-size:15.5px;color:var(--ink-2);max-width:64ch;}
+  .gate{display:inline-flex;align-items:baseline;gap:9px;font-family:"JetBrains Mono",monospace;
+    font-size:12px;padding:5px 11px;border-radius:3px;background:var(--ok-soft);color:var(--ink);
+    border:1px solid color-mix(in srgb,var(--ok) 35%,transparent);margin-top:6px;}
+  .gate.cost{background:var(--accent-soft);border-color:color-mix(in srgb,var(--accent) 30%,transparent);}
+  .gate b{color:var(--ok);font-weight:500;}
+  .gate.cost b{color:var(--accent);}
+
+  .trap{border-left:3px solid var(--warn);background:var(--warn-soft);padding:14px 18px;
+    border-radius:0 4px 4px 0;margin:16px 0;}
+  .trap h4{margin:0 0 5px;font-size:13px;font-family:"JetBrains Mono",monospace;
+    letter-spacing:.08em;text-transform:uppercase;color:var(--warn);}
+  .trap p{margin:0;font-size:14.5px;color:var(--ink);max-width:62ch;}
+
+  .tw{overflow-x:auto;margin:18px 0;}
+  table{border-collapse:collapse;width:100%;min-width:480px;font-size:14.5px;}
+  caption{text-align:left;font-size:13px;color:var(--ink-2);padding-bottom:9px;}
+  th,td{padding:9px 14px 9px 0;text-align:right;border-bottom:1px solid var(--rule);}
+  th:first-child,td:first-child{text-align:left;}
+  thead th{font-family:"JetBrains Mono",monospace;font-size:10px;font-weight:500;
+    letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3);border-bottom-color:var(--ink-3);}
+  tbody td{font-family:"JetBrains Mono",monospace;font-variant-numeric:tabular-nums;}
+  tbody td:first-child{font-family:"Source Sans 3",sans-serif;}
+  tbody tr:last-child td{border-bottom:0;}
+  tr.total td{font-weight:600;border-top:2px solid var(--ink-3);}
+  .dense{color:var(--accent);font-weight:500;}
+  .frozen{color:var(--ink-3);}
+
+  pre{background:var(--surface);border:1px solid var(--rule);border-radius:4px;
+    padding:16px 18px;overflow-x:auto;font-size:13px;line-height:1.7;
+    font-family:"JetBrains Mono",monospace;margin:14px 0;box-shadow:var(--shadow);}
+  pre .c{color:var(--ink-3);}
+  pre b{color:var(--accent);font-weight:500;}
+
+  ul{padding-left:20px;max-width:68ch;}
+  li{margin-bottom:9px;}
+  li::marker{color:var(--ink-3);}
+  .open li{margin-bottom:12px;}
+  footer{margin-top:52px;padding-top:24px;border-top:1px solid var(--rule);
+    font-size:13.5px;color:var(--ink-2);}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;}}
+</style>
+
+<div class="page">
+
+<header>
+  <div class="eyebrow">Methods · Mercurius 0.8B</div>
+  <h1>Mercurius Conversion Recipe</h1>
+  <p class="sub">Turning a trained Qwen3.5 into a cheaper-to-serve architecture, and adapting it back to health, entirely on one 64&nbsp;GB Jetson.</p>
+  <dl class="facts">
+    <div><dt>Base</dt><dd>Qwen3.5-0.8B</dd></div>
+    <div><dt>Hardware</dt><dd>Jetson AGX Orin 64&nbsp;GB</dd></div>
+    <div><dt>Trainable</dt><dd>293.91 M / 791.7 M</dd></div>
+    <div><dt>Corpus</dt><dd>FineWeb-Edu, 26.3 M tok</dd></div>
+  </dl>
+</header>
+
+<section>
+  <h2>The five stages</h2>
+  <p class="lede">Each runs on the output of the last, at full precision, before any quantization. Every stage that claims exactness has to prove it against a matched perturbation control — absolute thresholds are unusable here, since a 1e-7 perturbation moves logits by 5e-3.</p>
+
+  <div class="stage">
+    <div class="stage-key">A</div>
+    <div>
+      <h3>Norm fusion → ScaleNorm</h3>
+      <p>Fold each RMSNorm's gain into the weights of every consumer projection: <code>W @ (γ ⊙ x̂) = (W @ diag γ) @ x̂</code>, leaving a parameter-free norm — which is ScaleNorm with a fixed gain.</p>
+      <span class="gate"><b>gate</b> bit-exact vs the unmodified model</span>
+      <div class="trap">
+        <h4>Trap</h4>
+        <p>Qwen3.5's RMSNorm is <strong>zero-centered</strong>: <code>out = x/rms(x) · (1 + weight)</code>, weight initialized to zeros. Fold <code>(1 + weight)</code> and reset to <code>0.0</code>, not <code>1.0</code>. Folding <code>weight</code> directly destroys the model — measured max logit delta 25.1, top-1 agreement 3.9%.</p>
+      </div>
+      <p>Three norms are deliberately <em>not</em> fused: the final <code>model.norm</code> (tied to <code>lm_head</code>), <code>q_norm</code>/<code>k_norm</code> (gain applied <em>after</em> normalization, so a nonlinearity sits between projection and gain), and <code>linear_attn.norm</code> (opposite ±1 convention — the gated norm stores the gain, ordinary norms store gain−1).</p>
+    </div>
+  </div>
+
+  <div class="stage">
+    <div class="stage-key">B</div>
+    <div>
+      <h3>GatedDeltaNet → KDA (transKDA)</h3>
+      <p>Lift the 18 linear-attention layers to Kimi Delta Attention by tiling the per-head scalar decay into a diagonal: <code>A_log (H,) → (H, D<sub>k</sub>)</code>. This is the canonical embedding of GDN inside KDA, so the richer parameterization starts as a no-op.</p>
+      <span class="gate"><b>gate</b> bit-exact at the tiled init</span>
+      <p>Optional decay seeding spreads channels across retention horizons. It is <strong>not</strong> exact, and a 13-arm ablation found the channel assignment is high-variance and unpredictable — control σ = 1.26 on ppl@32768, with the best single arm a <em>random</em> permutation. Weight-derived assignment beat random by 0.3σ, which is not evidence.</p>
+    </div>
+  </div>
+
+  <div class="stage">
+    <div class="stage-key">C</div>
+    <div>
+      <h3>NoPE</h3>
+      <p>Drive every rotary frequency to identity — <code>cos → 1</code>, <code>sin → 0</code>. No weight change, fully reversible, so a sweep costs only forward passes. Qwen3.5 uses partial rotary (64 of 256 head dims), so this touches a quarter of each head.</p>
+      <span class="gate cost"><b>cost</b> +12.70% ppl@2048 at surgery</span>
+      <p>A matched control that kept RoPE and trained on identical data closed roughly a third of the recovery on its own, so NoPE-specific recovery is about two-thirds of the raw before-and-after.</p>
+    </div>
+  </div>
+
+  <div class="stage">
+    <div class="stage-key">D</div>
+    <div>
+      <h3>TransMLA with CARE whitening</h3>
+      <p>Replace K and V on the 6 full-attention layers with one shared low-rank latent, balanced before factorization so the rank budget isn't spent on whichever matrix is larger. The SVD runs in the <strong>whitened</strong> basis — <code>M = W·L</code> where <code>C = LLᵀ</code> — which optimizes activation error rather than weight error.</p>
+      <span class="gate cost"><b>ratio</b> d_c = 256 → 4.00× KV</span>
+      <p>Whitening is worth up to <strong>26.76 pp</strong> of perplexity against plain SVD at this rank. <code>q_proj</code> is never touched: Qwen3.5 sets <code>attn_output_gate</code>, so half its output is the output gate and naive head-merging corrupts it.</p>
+    </div>
+  </div>
+
+  <div class="stage">
+    <div class="stage-key">R</div>
+    <div>
+      <h3>Recovery</h3>
+      <p>Distillation from the unmodified Qwen3.5-0.8B, teacher run <strong>live</strong> each step, with exact full-vocabulary KL computed in chunks so neither model's <code>(T, 248320)</code> logits are ever resident.</p>
+      <pre><span class="c"># calibrate the whitening covariances, then recover</span>
+python src/<b>save_covs.py</b>
+
+python src/<b>train_recovery.py</b> \
+    --dial nope --seed-decay --seed-alpha 0 \
+    --init-adapters ckpt/adapters-combined.pt \
+    --mla-dc 256 --mla-covs cache/kv_covs.pt \
+    <b>--live-teacher</b> --seq 8192 \
+    --grad-checkpoint --ckpt-above 8192 \
+    --train-attn --train-norms \
+    --steps 150 --eval-every 50 --lr 3e-5</pre>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Adaptation surface</h2>
+  <p>What is frozen, what gets a low-rank adapter, and what is trained densely. The attention and linear-attention parameters are trained in full; LoRA is confined to the FFN.</p>
+
+  <div class="tw">
+    <table>
+      <caption>With <code>--train-attn --train-norms</code>. Totals are the run's own reported breakdown.</caption>
+      <thead>
+        <tr><th>Module</th><th>Treatment</th><th>Rank</th><th>Trainable</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>linear_attn.* (KDA, 18 layers)</td><td class="dense">dense</td><td>—</td><td>234.97 M</td></tr>
+        <tr><td>self_attn.* + MLA latents (6 layers)</td><td class="dense">dense</td><td>—</td><td>44.58 M</td></tr>
+        <tr><td>mlp.gate / up / down</td><td>LoRA</td><td>16</td><td>10.62 M</td></tr>
+        <tr><td>all normalization gains</td><td class="dense">dense, fp32</td><td>—</td><td>0.05 M</td></tr>
+        <tr><td>embed_tokens / lm_head (tied)</td><td class="frozen">frozen</td><td>—</td><td class="frozen">0</td></tr>
+        <tr class="total"><td>total</td><td></td><td></td><td>293.91 M</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>LoRA configuration</h3>
+  <p>Plain LoRA, no DoRA or VeRA variant: <code>out = base(x) + scale · (x @ Aᵀ) @ Bᵀ</code>. <code>A</code> is <code>(rank, in)</code> with Kaiming-uniform init (<code>a = √5</code>); <code>B</code> is <code>(out, rank)</code> initialized to <strong>zeros</strong>, so the adapted model starts exactly at the base model. Adapters are bf16; the wrapped base is frozen on injection.</p>
+  <p><strong>Scale is 1.0.</strong> <code>scale = (alpha or rank) / rank</code> and alpha is left unset, so alpha = rank and the ratio is unity at every rank — there is no rank-dependent LR scaling, and no per-parameter-group learning rates anywhere in the optimizer.</p>
+
+  <div class="tw">
+    <table>
+      <caption>Rank by module. Rank 0 means the rule matches but injection is skipped.</caption>
+      <thead><tr><th>Pattern</th><th>Rank</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td>self_attn q / k / v / o_proj</td><td>32</td><td>the dialled layers</td></tr>
+        <tr><td>linear_attn out_proj, in_proj_qkv</td><td>16</td><td></td></tr>
+        <tr><td>mlp gate / up / down_proj</td><td>16</td><td>the only LoRA-only surface</td></tr>
+        <tr><td>KDA gate (a_lora_A / a_lora_B)</td><td>32</td><td>built into the layer; A ~ N(0, 0.02), B = 0</td></tr>
+        <tr><td>lm_head, embed_tokens</td><td>0</td><td>skipped — tied, 254 M params</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Under <code>--train-attn</code> the <code>linear_attn.</code> and <code>self_attn.</code> prefixes unfreeze the dense base weights <em>alongside</em> their adapters, so those modules carry both paths and no adapter merge is needed to switch a module from low-rank to dense.</p>
+
+  <h3>Optimizer and schedule</h3>
+  <p>8-bit AdamW (<code>bitsandbytes</code>), <code>lr 3e-5</code>, betas <code>(0.9, 0.95)</code>, <strong>weight decay 0</strong> — on zero-centered norms, decay pulls the gain toward 1 and would erase exactly what Stage A folded. One-cycle schedule, <code>max_lr = lr</code>, <code>pct_start 0.05</code>. A single parameter group: dense and low-rank parameters share one learning rate.</p>
+  <div class="trap">
+    <h4>Learning rate is not transferable between surfaces</h4>
+    <p><code>2e-4</code> is a LoRA-scale rate and destroys a dense run: at 294 M dense parameters it drove the model to <span class="num">163%</span> worse than control before annealing back to <span class="num">104%</span>. <code>3e-5</code> is the dense-safe value used throughout.</p>
+  </div>
+
+  <h3>What the objective is — and is not</h3>
+  <p>Recovery uses <strong>output-level full-vocabulary KL</strong> against a live teacher. It does <strong>not</strong> use attention distillation. A layer-local hidden-state transfer exists in the codebase (LoLCATs-style, <code>train_transfer.py</code>) and is not invoked by any recovery run; matching attention maps is O(n²) and infeasible at the lengths where the damage lives — 16 GiB per layer at 32k.</p>
+  <p>The teacher-free cross-entropy term is available (<code>--lm-weight</code>) and is set to <strong>0</strong>. It exists to cover positions where a truncated top-k target is silent, which full-vocabulary KL does not have.</p>
+</section>
+
+<section>
+  <h2>Why the teacher runs live</h2>
+  <p>An offline cache of the teacher's top-64 logits is ~35% cheaper per step and was the original design. It is wrong in two ways that took a day to find, both of which distort exactly the long-range behaviour the conversion damages.</p>
+  <div class="trap">
+    <h4>Truncation — the gradient points the wrong way</h4>
+    <p>At k = 64 over a 248,320-token vocabulary, top-k distillation closes roughly <strong>5%</strong> of the gap between plain cross-entropy and full distillation, with a parameter gradient about <strong>48° off</strong> the full-distillation direction at 1.8× the norm. On this corpus the true next token falls outside the cached top-64 on <span class="num">10.8%</span> of positions, where the loss says nothing at all.</p>
+  </div>
+  <div class="trap">
+    <h4>Context — the objective penalizes correct retrieval</h4>
+    <p>A cache built on independent 2048-token blocks conditions each stored distribution on at most 2047 tokens, while training draws windows up to 32768. Forward KL is mode-covering, so a teacher that cannot see the first copy of a needle spreads its mass and the loss <em>penalizes</em> a student that retrieves correctly. Measured at a 4096-token gap: teacher NLL on the needle <span class="num">2.01 → 16.50</span>, top-1 accuracy <span class="num">87.5% → 0%</span>, and a retrieving student scored <span class="num">+2.90 nats</span> worse than one mimicking the uninformed teacher.</p>
+  </div>
+  <p>Running the teacher live removes both, costs roughly 30–50% wall-clock, and gives every layer's hidden states for free should a layer-local term ever be wanted.</p>
+</section>
+
+<section>
+  <h2>Infrastructure that is load-bearing</h2>
+  <ul>
+    <li><strong>fp32 norm gains.</strong> At <code>w ≈ 0.5</code> the bf16 ULP is <span class="num">3.91e-3</span> while an Adam step at 2e-4 is ~2e-4 — the update rounds to <strong>exactly zero</strong>. All 55,552 gains are cast to fp32; <code>q_norm</code>/<code>k_norm</code> receive no gradient at all otherwise.</li>
+    <li><strong>Checkpoint on <code>requires_grad</code>, never a name list.</strong> A hardcoded filter silently discarded <code>in_proj_a</code>'s 37.7 M dense parameters — the run trained them, the eval curve showed the benefit, the weights were dropped on save.</li>
+    <li><strong>Length-conditional gradient checkpointing.</strong> Worth <span class="num">1.43×</span>: at 8192 the un-checkpointed peak is 25.5 GiB, which fits; at 32768 it does not, and checkpointing is mandatory there.</li>
+    <li><strong><code>causal_conv1d</code> built for sm_87</strong> (<code>TORCH_CUDA_ARCH_LIST=8.7</code>, source build — no published wheel targets this board). <span class="num">12×</span> on that op, correct to 5.5e-3 relative, and it runs 18 times per forward.</li>
+    <li><strong>No <code>torch.compile</code>.</strong> Inductor decomposes SDPA instead of preserving FlashAttention, materializing a <span class="num">16 GiB</span> n² attention matrix at 32k. It regresses 13% at short context and OOMs at long.</li>
+    <li><strong>Resumable runs.</strong> Weights, Adam moments, one-cycle position and both sampler RNG streams, written once per eval at ~1.1 GiB. Restarting from a weight checkpoint alone re-initializes the moments and restarts the schedule at zero — a different run, not a continuation.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Still unsettled</h2>
+  <ul class="open">
+    <li><strong>Rank allocation.</strong> CARE's water-filling over a fixed budget is implemented and corrected — the original priority function handed 67% of the budget to the layer that compressed <em>best</em>. The whitened version reduces summed activation error by 5.02% at identical 4.00× KV, and made starting perplexity 0.8% <em>worse</em>. Optimizing its own proxy is not evidence; it stays off.</li>
+    <li><strong>Attention logit scaling (SSMax).</strong> The premise holds here — mean attention entropy climbs <span class="num">+0.98</span> from 512 to 4096 tokens, and per-head scaling cuts that climb by <span class="num">54%</span>. 48 parameters, a bit-exact no-op at the reference length in bf16. Implemented, never trained.</li>
+    <li><strong>Vision.</strong> The ViT is intact and untouched at the original checkpoint — 153 tensors, its own 48×48 absolute position grid, and internal 2D rotary, none of which language-trunk surgery can reach. It is dropped at load rather than damaged. Reattachment is unwritten.</li>
+    <li><strong>Convergence.</strong> No run in this project has reached it. Every one ended on wall-clock with the loss still descending.</li>
+  </ul>
+</section>
+
+<footer>
+  <p>Mercurius is the Roman god of translation and of boundaries — of carrying something across into a new form, and of doing it quickly. These models are Qwen3.5 carried across into a cheaper architecture, not built from nothing. Sizes are parameter counts; the family name is the only mythological one.</p>
+</footer>
+
+</div>

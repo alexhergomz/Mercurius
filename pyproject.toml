@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mercurius"
+version = "0.1.0"
+description = "Architecture surgery and distillation recovery for Qwen3.5-class models on a single device"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+
+# Deliberately unpinned except where a version is load-bearing. This runs on a
+# Jetson AGX Orin (sm_87), where torch comes from NVIDIA's wheel index rather
+# than PyPI -- pinning torch here would make the project uninstallable on the
+# one machine it was built for. See README "Hardware notes".
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.57",
+    "safetensors>=0.4",
+    "bitsandbytes>=0.43",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# causal-conv1d has no published wheel for sm_87 and must be built from source:
+#   TORCH_CUDA_ARCH_LIST=8.7 pip install -v --no-build-isolation causal-conv1d
+# Worth it: 12x on that op, which runs 18 times per forward pass.
+kernels = ["causal-conv1d>=1.4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"

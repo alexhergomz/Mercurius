@@ -1,0 +1,26 @@
+# Model weights and training artifacts — never committed. The base model is
+# ~1.7 GB, a single resume file is ~1.2 GB, and the board's root filesystem is
+# the only filesystem.
+ckpt/
+models/
+cache/
+logs/
+data/
+probe/
+*.pt
+*.safetensors
+*.bin
+
+# Environments
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
