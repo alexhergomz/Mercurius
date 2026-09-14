@@ -28,7 +28,8 @@ from mercurius.models.kda import (load_kda_model, enable_state_passing, reset_st
 from mercurius.surgery.norm_fusion import get_trunk
 from mercurius.surgery.rope_dial import install_rope_dial
 from mercurius.adapters.lora import (inject_lora, freeze_base, trainable_parameters,
-                  merge_and_restart, merged_base_names, resize_lora)
+                  merge_and_restart, merged_base_names, resize_lora,
+                  rules_from_checkpoint)
 from mercurius.eval.characterize import perplexity
 from mercurius.eval.suite import ce_and_topk, sample, report, PROMPTS
 import bitsandbytes as bnb
@@ -45,12 +46,19 @@ EVAL_DATA  = str(WIKITEXT)      # eval, held out
 LORA_RULES = [
     ("self_attn.q_proj", 32), ("self_attn.k_proj", 32),
     ("self_attn.v_proj", 32), ("self_attn.o_proj", 32),   # the dialled layers
-    ("linear_attn.out_proj", 16), ("linear_attn.in_proj_qkv", 16),
+    # KDA projections carry a per-rule alpha. Under rsLoRA the scale is
+    # alpha/sqrt(r), so alpha=4 gives 1.0 at rank 16, 0.707 at 32, 0.5 at 64 --
+    # the update magnitude stays put as rank rises instead of growing like
+    # sqrt(r), which is what the classic convention does and what made the
+    # earlier rank-64 arm uninterpretable. The attention and FFN groups have no
+    # per-rule alpha, so they stay on the classic convention at scale 1.0 and a
+    # KDA rank sweep cannot move them.
+    ("linear_attn.out_proj", 16, 4.0), ("linear_attn.in_proj_qkv", 16, 4.0),
     # in_proj_z is 16.5% of KDA and had no adaptation path at all: frozen under
     # every LoRA-only arm, dense only under --train-attn. Under --train-attn the
     # base unfreezes alongside this adapter, so dense runs gain 0.88 M redundant
     # adapter params -- val-full's recorded numbers predate this rule.
-    ("linear_attn.in_proj_z", 16),
+    ("linear_attn.in_proj_z", 16, 4.0),
     # FFN at 32, not 16. The rank-16 adapter was saturated: effective rank
     # 12.0-12.3 of 16 with sigma1/sigma16 = 3.8, against ~1.3 for a random
     # init, so training had shaped the spectrum and still used nearly every
@@ -570,21 +578,35 @@ def main():
     # trained rank 16.
     rules = LORA_RULES
     if a.kda_rank:
-        rules = [(p, a.kda_rank if p.startswith("linear_attn.") else r)
-                 for p, r in LORA_RULES]
+        rules = [((rule[0], a.kda_rank) + tuple(rule[2:]))
+                 if rule[0].startswith("linear_attn.") else rule
+                 for rule in LORA_RULES]
         print(f"  KDA projection LoRA rank -> {a.kda_rank}", flush=True)
 
     if a.init_adapters:
-        inject_lora(student, LORA_RULES, verbose=False,
+        # Inject at the CHECKPOINT's ranks, not the recipe's. They diverge the
+        # moment any rule changes, and load_state_dict forgives missing keys but
+        # not mismatched shapes, so the run dies at startup rather than loading
+        # a different model -- which is the good failure, but only if the ranks
+        # are read from the file.
+        _sd = torch.load(a.init_adapters, map_location="cpu")
+        ckpt_rules = rules_from_checkpoint(_sd)
+        inject_lora(student, ckpt_rules, verbose=False,
                     alpha=a.lora_alpha, rslora=a.rslora)
         freeze_base(student)
-        _sd = torch.load(a.init_adapters, map_location="cpu")
         student.load_state_dict({k: v.cuda() for k, v in _sd.items()}, strict=False)
         print(f"  init from {a.init_adapters.split('/')[-1]} "
               f"({len(_sd)} tensors)", flush=True)
-        if a.kda_rank:
-            # fold the loaded rank-16 delta into the bases FIRST, then resize;
-            # otherwise changing the rank silently discards the prior init
+        want = {r[0]: r[1] for r in rules}
+        have = dict(ckpt_rules)
+        if any(want.get(k) not in (None, v) for k, v in have.items()) or \
+           any(k not in have for k in want):
+            # fold the loaded delta into the bases FIRST, then resize; the other
+            # order discards the prior init silently
+            diffs = {k: (have.get(k), want.get(k)) for k in set(have) | set(want)
+                     if have.get(k) != want.get(k)}
+            print(f"  init checkpoint ranks differ from the recipe: {diffs}",
+                  flush=True)
             merge_and_restart(student)
             resize_lora(student, rules)
 

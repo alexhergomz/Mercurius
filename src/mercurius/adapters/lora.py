@@ -59,8 +59,43 @@ class LoRALinear(nn.Module):
         return out + self.scale * d.to(out.dtype)
 
 
+def rules_from_checkpoint(sd):
+    """Derive LoRA rules from a checkpoint's own tensor shapes.
+
+    Anything that rebuilds a model to match a checkpoint must read the
+    CHECKPOINT, never the current recipe. LORA_RULES tracks whatever the recipe
+    uses now, so every change to it invalidates loading for every checkpoint on
+    disk -- raising the FFN rank from 16 to 32 broke both the evaluator and the
+    --init-adapters path, in two separate places, on the same day.
+
+    Each `<module>.lora_A` has shape (rank, in_features), so the structure is
+    recoverable from the file.
+    """
+    rules = {}
+    for k, v in sd.items():
+        if not k.endswith(".lora_A"):
+            continue
+        path = k[: -len(".lora_A")]
+        if path.endswith(".base"):          # inner adapter of a double wrap
+            path = path[: -len(".base")]
+        pat = ".".join(path.split(".")[-2:])
+        rules[pat] = int(v.shape[0])
+    return sorted(rules.items(), key=lambda kv: -len(kv[0]))
+
+
 def inject_lora(model, rules, verbose=True, alpha=None, rslora=False):
-    """rules: list of (substring, rank). First match wins; rank 0 = skip."""
+    """rules: (pattern, rank) or (pattern, rank, alpha). First match wins; 0 skips.
+
+    A PER-RULE alpha matters once the model has several rank groups. This one has
+    three -- attention at 32, FFN at 32, KDA projections at whatever is being
+    swept -- and a single global alpha under rsLoRA rescales all of them. That is
+    not hypothetical: alpha=4 across mixed ranks left rank 16 alone but scaled
+    the rank-32 attention adapters by 0.707, which changed the model at step 0
+    and made two runs non-comparable.
+
+    With a per-rule alpha each group keeps the scale it should, and rsLoRA's
+    1/sqrt(r) law applies within the group whose rank is actually moving.
+    """
     injected, total_new = [], 0
     seen = set()
     for mod_name, parent in list(model.named_modules()):
@@ -72,7 +107,10 @@ def inject_lora(model, rules, verbose=True, alpha=None, rslora=False):
             seen.add(id(child))
             full = f"{mod_name}.{child_name}" if mod_name else child_name
             rank = None
-            for pat, r in rules:
+            rule_alpha = alpha
+            for rule in rules:
+                pat, r = rule[0], rule[1]
+                ra = rule[2] if len(rule) > 2 else None
                 # endswith, NOT substring. A LoRA-wrapped target exposes its
                 # frozen base at "<target>.base", which CONTAINS the pattern, so
                 # a substring test re-wraps it on any second injection pass --
@@ -83,11 +121,14 @@ def inject_lora(model, rules, verbose=True, alpha=None, rslora=False):
                 # at 2x the adapter params. Every run before 2026-09-13 has this.
                 if full.endswith(pat):
                     rank = r
+                    if ra is not None:
+                        rule_alpha = ra
                     break
             if not rank:
                 continue
             setattr(parent, child_name,
-                    LoRALinear(child, rank, alpha=alpha, rslora=rslora))
+                    LoRALinear(child, rank, alpha=rule_alpha,
+                               rslora=rslora and rule_alpha is not None))
             total_new += rank * (child.in_features + child.out_features)
             injected.append((full, rank))
     if verbose:
@@ -157,7 +198,8 @@ def resize_lora(model, rules, verbose=True):
     for name, mod in model.named_modules():
         if not isinstance(mod, LoRALinear):
             continue
-        for pat, r in rules:
+        for rule in rules:
+            pat, r = rule[0], rule[1]
             if not name.endswith(pat):
                 continue
             if r and r != mod.rank:
