@@ -11,14 +11,42 @@ import torch
 import torch.nn as nn
 
 
+def _lora_scale(rank, alpha, rslora):
+    if rslora:
+        return (alpha if alpha is not None else 4.0) / math.sqrt(rank)
+    return (alpha or rank) / rank
+
+
 class LoRALinear(nn.Module):
-    def __init__(self, base: nn.Linear, rank: int, alpha: float | None = None):
+    """out = base(x) + scale * (x @ A.T) @ B.T
+
+    scale follows one of two conventions:
+
+      classic (Hu et al.)   scale = alpha / rank
+      rank-stabilized       scale = alpha / sqrt(rank)      (rsLoRA, 2312.03732)
+
+    rsLoRA's Theorem 3.2: an adapter is rank-stabilized iff the factor is
+    Theta(1/sqrt(r)). Under the classic convention with alpha tied to rank the
+    factor is constant in r, so the adapter's output grows like sqrt(r) and rank
+    is confounded with step size -- measured here, ||scale*BA|| grew as r^0.54
+    after one step and r^0.73 by step 20. That makes a rank sweep uninterpretable
+    and leaves the magnitude set by an arbitrary constant.
+
+    With alpha fixed, alpha/sqrt(r) holds the output magnitude constant as rank
+    changes. alpha=4 reproduces the previous scale of 1.0 at rank 16, so
+    enabling rsLoRA at that alpha changes nothing at the current rank and only
+    corrects the behaviour when rank moves.
+    """
+    def __init__(self, base: nn.Linear, rank: int, alpha: float | None = None,
+                 rslora: bool = False):
         super().__init__()
         self.base = base
         for p in self.base.parameters():
             p.requires_grad_(False)
         self.rank = rank
-        self.scale = (alpha or rank) / rank
+        self.alpha = alpha
+        self.rslora = rslora
+        self.scale = _lora_scale(rank, alpha, rslora)
         dev = base.weight.device
         dt = torch.bfloat16 if base.weight.dtype != torch.float32 else torch.float32
         self.lora_A = nn.Parameter(torch.zeros(rank, base.in_features, device=dev, dtype=dt))
@@ -31,7 +59,7 @@ class LoRALinear(nn.Module):
         return out + self.scale * d.to(out.dtype)
 
 
-def inject_lora(model, rules, verbose=True):
+def inject_lora(model, rules, verbose=True, alpha=None, rslora=False):
     """rules: list of (substring, rank). First match wins; rank 0 = skip."""
     injected, total_new = [], 0
     seen = set()
@@ -58,7 +86,8 @@ def inject_lora(model, rules, verbose=True):
                     break
             if not rank:
                 continue
-            setattr(parent, child_name, LoRALinear(child, rank))
+            setattr(parent, child_name,
+                    LoRALinear(child, rank, alpha=alpha, rslora=rslora))
             total_new += rank * (child.in_features + child.out_features)
             injected.append((full, rank))
     if verbose:
@@ -134,7 +163,7 @@ def resize_lora(model, rules, verbose=True):
             if r and r != mod.rank:
                 dev, dt = mod.lora_A.device, mod.lora_A.dtype
                 mod.rank = r
-                mod.scale = 1.0                      # alpha = rank convention
+                mod.scale = _lora_scale(r, mod.alpha, mod.rslora)
                 mod.lora_A = nn.Parameter(torch.zeros(
                     r, mod.base.in_features, device=dev, dtype=dt))
                 mod.lora_B = nn.Parameter(torch.zeros(

@@ -8,6 +8,48 @@ Last updated 2026-09-13.
 
 ---
 
+## 0. Framing correction (2026-09-13)
+
+**Sections 2.0 onward compare converted models against each other and describe
+the differences as a deficit. That framing is wrong.** The question this project
+answers is whether a converted model matches the model it was carved out of.
+Differences between two converted checkpoints describe adapter configuration.
+Treating the best of them as the reference turned an internal ablation into an
+apparent shortfall, and a working result was reported as a 1.2-point gap for
+most of a day.
+
+Measured 2026-09-14, one table, directly-loaded original, all arms
+reconstructable, `src/eval_retrieval_ab.py`:
+
+| arm | ppl@2048 | ppl@8192 | gain@1k | gain@4k | gain@16k |
+|---|---|---|---|---|---|
+| **original** | 12.801 | 18.285 | 13.474 | 13.487 | 12.689 |
+| `valfix` (short corpus) | 12.496 | 17.404 | 13.260 | 13.659 | 12.801 |
+| `longdoc-c` (long corpus) | **12.346** | **17.014** | 13.375 | **13.772** | **12.950** |
+
+`longdoc-c` vs original: **-3.55% ppl@2048, -6.95% ppl@8192, +0.285 retrieval
+at 4k, +0.261 at 16k**, at a 4x smaller KV cache, 18 of 24 layers linearized,
+no positional encoding, after 1.23 M tokens of recovery.
+
+Three readings:
+
+- **The only place the converted model is behind is SHORT-gap retrieval** (1k):
+  -0.099 for `longdoc-c`, -0.214 for `valfix`. It is ahead at 4k and 16k and on
+  perplexity at both lengths. The trade is a small local-retrieval cost buying
+  long-range improvement -- the opposite of the long-context deficit assumed
+  through most of this project.
+- **The advantage grows with context**: -3.55% at 2048 against -6.95% at 8192.
+- **Long documents help at every gap**, +0.115 / +0.113 / +0.149 over `valfix`,
+  and halve the 1k deficit. The data treatment is worth 2.22% perplexity and
+  ~0.13 retrieval -- the largest single lever measured in this project, against
+  ~1% for the LoRA learning rate and under 0.5% for every architectural change
+  tried (two of which were negative).
+
+**Rule for future evaluation: always include the unmodified original as an arm.**
+`src/eval_retrieval_ab.py` takes `original=ORIGINAL` for this.
+
+---
+
 ## 1. Measured — headline results
 
 ### 1.1 Three-way validation (the presentable result)
@@ -145,6 +187,25 @@ not IFT-shaped**. Biderman: LoRA matches full FT on instruction finetuning at
 r=256, but "in CPT, LoRA underperforms full finetuning across all
 configurations." LoLCATs says the same in its own limitations section for
 linearized models (up to 42.4 points on 5-shot MMLU).
+
+### 2.0g Fixing the double-adapter bug cost 0.6% -- the FFN wants more rank
+
+| arm | start | best | trainable |
+|---|---|---|---|
+| `val-full` (double adapters, cycled beta1) | 20.362 | **17.292** @100 | 293.91 M |
+| `valfix` (both fixed) | 20.362 | **17.397** @100 | 283.88 M |
+
+Same start, so this is clean. The bug gave every target TWO parallel rank-16
+adapters -- effectively rank 32 -- and removing it lost 0.6% and 10 M adapter
+parameters.
+
+That matches the FFN saturation measurement: the rank-16 adapter used 12.0-12.3
+of its 16 directions with a shallow spectrum (sigma1/sigma16 = 3.8, against ~1.3
+for a random init), which said capacity was binding. The bug was accidentally
+supplying what the measurement asked for.
+
+The principled version is one adapter at rank 32 rather than two at rank 16.
+Untested.
 
 ### 2.0e Eval noise floor is ZERO, and the adapter-surface sweep (2026-09-13)
 

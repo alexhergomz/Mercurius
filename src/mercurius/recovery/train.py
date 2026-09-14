@@ -24,7 +24,7 @@ import sys, os, json, time, argparse, torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from mercurius.models.kda import (load_kda_model, enable_state_passing, reset_state,
-                       promote_state)
+                       promote_state, fuse_gate_lora)
 from mercurius.surgery.norm_fusion import get_trunk
 from mercurius.surgery.rope_dial import install_rope_dial
 from mercurius.adapters.lora import (inject_lora, freeze_base, trainable_parameters,
@@ -51,7 +51,15 @@ LORA_RULES = [
     # base unfreezes alongside this adapter, so dense runs gain 0.88 M redundant
     # adapter params -- val-full's recorded numbers predate this rule.
     ("linear_attn.in_proj_z", 16),
-    ("mlp.gate_proj", 16), ("mlp.up_proj", 16), ("mlp.down_proj", 16),
+    # FFN at 32, not 16. The rank-16 adapter was saturated: effective rank
+    # 12.0-12.3 of 16 with sigma1/sigma16 = 3.8, against ~1.3 for a random
+    # init, so training had shaped the spectrum and still used nearly every
+    # direction. Separately, the double-adapter bug gave these targets two
+    # parallel rank-16 adapters and removing it cost 0.6% (val-full 17.292 vs
+    # valfix 17.397 from the same start) -- the accident was supplying the
+    # capacity the measurement asked for. One adapter at 32 is the same
+    # capacity without the duplicate.
+    ("mlp.gate_proj", 32), ("mlp.up_proj", 32), ("mlp.down_proj", 32),
     ("lm_head", 0), ("embed_tokens", 0),
 ]
 
@@ -175,7 +183,7 @@ def save_resume(path, model, opt, sched, step, gens):
                 "gens": {k: g.get_state() for k, g in gens.items()}}, path)
 
 
-def batches(ids, seq_len_fn, steps, seed=0, align=1, gen=None):
+def batches(ids, seq_len_fn, steps, seed=0, align=1, gen=None, spans=None):
     """Random windows -- each step independent.
 
     `align` snaps offsets to multiples of the teacher cache's block size. Without
@@ -189,11 +197,54 @@ def batches(ids, seq_len_fn, steps, seed=0, align=1, gen=None):
     g = gen if gen is not None else torch.Generator().manual_seed(seed)
     for step in range(steps):
         seq_len = seq_len_fn(step)
-        hi = len(ids) - seq_len - 1
-        i = int(torch.randint(0, hi, (1,), generator=g))
+        if spans is not None:
+            # pick a document long enough, then a window INSIDE it, so the
+            # window never straddles a boundary
+            ok = [(s, e) for s, e in spans if e - s > seq_len]
+            if not ok:
+                raise SystemExit(f"no document reaches {seq_len} tokens")
+            s, e = ok[int(torch.randint(0, len(ok), (1,), generator=g))]
+            i = s + int(torch.randint(0, e - s - seq_len, (1,), generator=g))
+        else:
+            hi = len(ids) - seq_len - 1
+            i = int(torch.randint(0, hi, (1,), generator=g))
         if align > 1:
             i = (i // align) * align
         yield ids[i:i + seq_len].unsqueeze(0), False, i
+
+
+def tokenize_by_document(tok, path, min_len):
+    """Tokenize per document and return the stream plus per-document spans.
+
+    Without this the corpus is one concatenated stream and a window is whatever
+    happens to be adjacent. Measured on fineweb_edu.txt: median document 550
+    tokens, so an 8192 window spans about 15 unrelated documents and contains no
+    dependency longer than a couple of thousand tokens. Training a long-context
+    repair on that cannot work, whatever the architecture does.
+
+    Returns spans only for documents that are at least min_len long, so a window
+    drawn inside one is entirely within a single document.
+    """
+    docs = [d for d in open(path).read().split("\n\n") if d.strip()]
+    chunks, spans, pos = [], [], 0
+    for d in docs:
+        ids = tok(d, return_tensors="pt", add_special_tokens=False).input_ids[0]
+        n = int(ids.numel())
+        if n >= min_len:
+            spans.append((pos, pos + n))
+        chunks.append(ids)
+        pos += n
+    stream = torch.cat(chunks)
+    kept = sum(e - s for s, e in spans)
+    print(f"  document-aware: {len(docs):,} docs, {len(spans):,} at least "
+          f"{min_len} tokens ({kept/1e6:.1f} M of {pos/1e6:.1f} M tokens usable)",
+          flush=True)
+    if not spans:
+        raise SystemExit(
+            f"no document in {path.split('/')[-1]} reaches {min_len} tokens. "
+            f"Use src/get_long_data.py to build a long-document corpus, or "
+            f"lower --seq.")
+    return stream, spans
 
 
 # Variable-length sampling (Dataset Decomposition, 2405.13226): instead of a
@@ -383,6 +434,40 @@ def main():
     ap.add_argument("--head-chunk", type=int, default=2048,
                     help="positions per lm_head chunk in the cached-KL path; "
                          "bounds peak head memory independently of seq length")
+    ap.add_argument("--train-data", default=None,
+                    help="override the training corpus. data/fineweb_edu_long.txt\n"
+                         "holds 30.0 M tokens in 3,522 documents averaging 8,519\n"
+                         "tokens, against the default corpus's 550 median -- use\n"
+                         "it with --doc-aware for genuine long-range structure.")
+    ap.add_argument("--pct-start", type=float, default=0.05,
+                    help="fraction of steps spent warming up. At 150 steps the\n"
+                         "default is 7.5 steps of warmup; LR is still 79%% of\n"
+                         "peak at step 50 and 26%% at step 100.")
+    ap.add_argument("--rslora", action="store_true",
+                    help="rank-stabilized LoRA scaling: alpha/sqrt(rank) rather\n"
+                         "than alpha/rank. Decouples the update magnitude from\n"
+                         "rank. alpha=4 reproduces the old scale at rank 16.")
+    ap.add_argument("--lora-alpha", type=float, default=None,
+                    help="LoRA alpha. Default None means alpha=rank, giving\n"
+                         "scale 1.0; common practice is scale 2 (alpha=2*rank,\n"
+                         "or alpha=8 under rsLoRA at rank 16).")
+    ap.add_argument("--doc-aware", action="store_true",
+                    help="tokenize per document and draw each window INSIDE a "
+                         "single document. Without it the corpus is one stream: "
+                         "median document is 550 tokens, so an 8192 window "
+                         "spans ~15 unrelated documents and holds no dependency "
+                         "longer than ~2k. Needs a long-document corpus; build "
+                         "one with src/get_long_data.py.")
+    ap.add_argument("--keep-step-ckpts", action="store_true",
+                    help="also write a checkpoint at every eval, not just the "
+                         "best. Off by default: a merged-base run writes 1.1 "
+                         "GiB per file and the root filesystem is the only one.")
+    ap.add_argument("--fuse-gate-lora", action="store_true",
+                    help="fold KDA's in-class rank-32 gate adapter into "
+                         "in_proj_a and disable it, leaving the decay path a "
+                         "single dense matrix. Without this the tiled parameter "
+                         "cannot escape its rank-16 init: the parallel low-rank "
+                         "path carries ~7x more of the update and is rank 1.")
     ap.add_argument("--relora-warmup", type=int, default=0,
                     help="steps of LR re-warmup after each ReLoRA merge. The "
                          "method needs a jagged schedule: a restarted adapter "
@@ -421,9 +506,14 @@ def main():
     tok = AutoTokenizer.from_pretrained(CKPT)
     # DIFFERENT corpora: training on the eval set would make perplexity measure
     # memorization instead of recovery.
-    train_ids = tok(open(TRAIN_DATA).read(), return_tensors="pt").input_ids[0]
+    train_path = a.train_data or TRAIN_DATA
+    if a.doc_aware:
+        train_ids, doc_spans = tokenize_by_document(tok, train_path, a.seq)
+    else:
+        train_ids = tok(open(train_path).read(), return_tensors="pt").input_ids[0]
+        doc_spans = None
     eval_ids = tok(open(EVAL_DATA).read(), return_tensors="pt").input_ids[0]
-    print(f"train {len(train_ids):,} tok (fineweb-edu) | "
+    print(f"train {len(train_ids):,} tok ({train_path.split('/')[-1]}) | "
           f"eval {len(eval_ids):,} tok (wikitext, held out)", flush=True)
     print(f"dial={a.dial} seeded={a.seed_decay} steps={a.steps} seq={a.seq}",
           flush=True)
@@ -485,7 +575,8 @@ def main():
         print(f"  KDA projection LoRA rank -> {a.kda_rank}", flush=True)
 
     if a.init_adapters:
-        inject_lora(student, LORA_RULES, verbose=False)
+        inject_lora(student, LORA_RULES, verbose=False,
+                    alpha=a.lora_alpha, rslora=a.rslora)
         freeze_base(student)
         _sd = torch.load(a.init_adapters, map_location="cpu")
         student.load_state_dict({k: v.cuda() for k, v in _sd.items()}, strict=False)
@@ -496,6 +587,9 @@ def main():
             # otherwise changing the rank silently discards the prior init
             merge_and_restart(student)
             resize_lora(student, rules)
+
+    if a.fuse_gate_lora:
+        fuse_gate_lora(student)
 
     mla_latents = []
     if a.mla_energy is not None or a.mla_dc is not None or a.mla_budget is not None:
@@ -524,7 +618,7 @@ def main():
             if sa is not None and hasattr(sa.k_proj, "latent"):
                 mla_latents.append(sa.k_proj.latent)
 
-    inject_lora(student, rules)
+    inject_lora(student, rules, alpha=a.lora_alpha, rslora=a.rslora)
     # Substring matching against parameter names. LoRA-wrapped modules expose
     # their frozen base as "<mod>.base.weight", so a module-prefix pattern like
     # "linear_attn." unfreezes the dense base AND its adapter together -- which
@@ -549,6 +643,19 @@ def main():
     if a.train_norms:
         also = also + ("norm",)
     n_tr = freeze_base(student, also_train=also)
+    if a.fuse_gate_lora:
+        # freeze_base matches substrings and "lora_A" matches "a_lora_A", so the
+        # fused factors cannot be excluded through `also`. They are inert either
+        # way (lora_rank=0 means _decay skips them, so no gradient reaches them)
+        # but leaving them trainable puts 1.77 M dead parameters in the optimizer
+        # and in the reported count.
+        dead = 0
+        for nm, prm in student.named_parameters():
+            if "a_lora_" in nm:
+                prm.requires_grad_(False)
+                dead += prm.numel()
+        n_tr -= dead
+        print(f"  froze {dead/1e6:.2f} M fused gate-adapter params", flush=True)
     if a.train_gate or a.train_attn or a.train_norms:
         grp = {}
         for nm, p in student.named_parameters():
@@ -616,8 +723,13 @@ def main():
         groups, max_lr = params, a.lr
 
     opt = bnb.optim.AdamW8bit(groups, lr=a.lr, betas=(0.9, 0.95), weight_decay=0.0)
+    # cycle_momentum defaults to True and, for Adam-family optimizers, cycles
+    # BETA1 through the `betas` entry -- it overwrote our (0.9, 0.95) with
+    # (0.95, 0.95) at construction and then swept beta1 between 0.85 and 0.95.
+    # Every run before 2026-09-13 trained with a cycled beta1 nobody asked for.
     sched = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=max_lr, total_steps=a.steps, pct_start=0.05)
+        opt, max_lr=max_lr, total_steps=a.steps, pct_start=a.pct_start,
+        cycle_momentum=False)
 
     # Pull-to-init needs the pretrained value of every inherited dense weight.
     # Adapters are EXCLUDED: their "init" is kaiming/zeros, not a pretrained
@@ -637,6 +749,7 @@ def main():
               f"tensors ({mb:.2f} GB reference copy)", flush=True)
 
     hist = {"loss": [], "eval": []}
+    _best = {"ppl": float("inf"), "step": -1}
 
     def evaluate(step):
         student.eval()
@@ -660,12 +773,30 @@ def main():
         # ~6.3k tok/step is ~2.5 epochs over a 999k-token logit cache. Saving
         # only at the end threw the good checkpoint away with no way to get it
         # back -- the eval curve survived and the weights did not.
+        # Keep the BEST checkpoint, not every one. Measured across seven arms,
+        # every run peaks early and then degrades by 0.8-2.9%: gate8kv2 18.219
+        # at step 50 against 18.630 at 150, relora 18.144 against 18.676. Eval
+        # is bit-deterministic (spread 0.0000% over five repeats and three
+        # reloads), so that degradation is real and selecting on it is sound.
+        #
+        # This also SHRINKS the footprint: one overwritten best plus one final,
+        # instead of one file per eval. A merged-base run writes 1.1 GiB per
+        # checkpoint, so four evals cost 4.4 GiB where this costs 1.1 GiB.
+        cur = row[8192]["ppl"]
+        improved = cur < _best["ppl"]
+        if improved:
+            _best.update(ppl=cur, step=step)
         try:
             st = os.statvfs("/")
             if st.f_bavail * st.f_frsize > 8 * 2**30:      # keep 8 GiB headroom
                 ck = (f"ckpt/"
-                      f"adapters-{a.tag}-step{step}.pt")
-                save_trainable(student, ck)
+                      f"adapters-{a.tag}-best.pt")
+                if improved:
+                    save_trainable(student, ck)
+                    print(f"    best so far: ppl@8192 {cur:.3f} -> {ck.split('/')[-1]}",
+                          flush=True)
+                elif a.keep_step_ckpts:
+                    save_trainable(student, ck.replace("-best.pt", f"-step{step}.pt"))
                 # Overwritten each eval, so it stays ~1.1 GiB rather than growing.
                 if step > 0 and _resume_ctx:
                     save_resume(f"ckpt/resume-{a.tag}.pt",
@@ -728,6 +859,12 @@ def main():
     sample_ids = train_ids
     if cache is not None:
         sample_ids = train_ids[:cache["n_tokens"]]
+        if doc_spans is not None:
+            n = cache["n_tokens"]
+            before = len(doc_spans)
+            doc_spans = [(s, e) for s, e in doc_spans if e <= n]
+            print(f"  doc spans trimmed to the cached prefix: "
+                  f"{before} -> {len(doc_spans)}", flush=True)
         print(f"  sampling restricted to the cached prefix "
               f"({cache['n_tokens']:,} of {len(train_ids):,} tokens)", flush=True)
         # The CACHE is the real data budget, not the corpus. "epochs over train
@@ -791,7 +928,8 @@ def main():
               f"(optimizer moments, LR position and sampler RNG restored)", flush=True)
         del _rs
     gen = (sequential_batches(sample_ids, sl, a.steps - start_step) if a.state_passing
-           else batches(sample_ids, sl, a.steps - start_step, align=align, gen=_bg))
+           else batches(sample_ids, sl, a.steps - start_step, align=align,
+                       gen=_bg, spans=doc_spans))
     for step, (batch, new_doc, batch_offset) in enumerate(gen, start=start_step + 1):
         if a.state_passing and new_doc:
             reset_state(student)
@@ -916,6 +1054,12 @@ def main():
               f"({(a1['ppl']-a0['ppl'])/a0['ppl']*100:+.2f}%) | "
               f"top1 {a0['top1']:.2f} -> {a1['top1']:.2f}%")
     print(f"  tokens seen: {seen / 1e6:.2f} M")
+    if _best["step"] >= 0:
+        fin = hist["eval"][-1][8192]["ppl"]
+        gap = (fin / _best["ppl"] - 1) * 100
+        print(f"  BEST ppl@8192 {_best['ppl']:.3f} at step {_best['step']} "
+              f"(final {fin:.3f}, {gap:+.2f}% worse) -> "
+              f"ckpt/adapters-{a.tag}-best.pt", flush=True)
     return 0
 
 

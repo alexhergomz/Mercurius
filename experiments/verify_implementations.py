@@ -13,9 +13,11 @@ import sys
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mercurius.adapters.lora import (LoRALinear, inject_lora, freeze_base, merge_and_restart,
-                  merged_base_names, resize_lora)
+                  merged_base_names, resize_lora, _lora_scale)
 from mercurius.adapters.layerscale import ScaledOutput, install_layerscale
+from mercurius.models.kda import fuse_gate_lora
 
 FAILS = []
 
@@ -216,6 +218,74 @@ def t_relora_warmup_shape():
           all(abs(v - 1.0) < 1e-12 for v in lrs[:29]))
 
 
+class FakeKDA(nn.Module):
+    """Mirrors KDA's decay path: a dense projection plus an in-class adapter."""
+    def __init__(self, hidden=64, out=128, rank=8, dt=torch.float32):
+        super().__init__()
+        self.in_proj_a = nn.Linear(hidden, out, bias=False).to(dt)
+        self.lora_rank = rank
+        self.a_lora_A = nn.Parameter(torch.randn(rank, hidden, dtype=dt) * 0.02)
+        self.a_lora_B = nn.Parameter(torch.randn(out, rank, dtype=dt) * 0.02)
+
+    def decay(self, x):
+        a = self.in_proj_a(x)
+        if self.lora_rank > 0:
+            a = a + F.linear(F.linear(x, self.a_lora_A), self.a_lora_B)
+        return a
+
+
+def t_fuse_gate_lora():
+    torch.manual_seed(0)
+    holder = nn.Module()
+    holder.k = FakeKDA()
+    x = torch.randn(4, 64)
+    before = holder.k.decay(x)
+    n = fuse_gate_lora(holder, verbose=False)
+    after = holder.k.decay(x)
+    rel = float((before - after).norm() / before.norm())
+    check("gate-lora fusion preserves the decay path", rel < 1e-6,
+          f"rel err {rel:.2e}")
+    check("fusion visited the layer", n == 1)
+    check("lora_rank switched off so the branch is skipped",
+          holder.k.lora_rank == 0)
+    check("a_lora factors zeroed",
+          float(holder.k.a_lora_A.abs().max()) == 0.0
+          and float(holder.k.a_lora_B.abs().max()) == 0.0)
+    check("a_lora factors frozen",
+          not holder.k.a_lora_A.requires_grad and not holder.k.a_lora_B.requires_grad)
+    # and the dense matrix genuinely absorbed it
+    holder2 = nn.Module(); torch.manual_seed(0); holder2.k = FakeKDA()
+    w0 = holder2.k.in_proj_a.weight.detach().clone()
+    fuse_gate_lora(holder2, verbose=False)
+    moved = float((holder2.k.in_proj_a.weight - w0).norm())
+    check("in_proj_a absorbed the adapter", moved > 1e-6, f"moved {moved:.4f}")
+
+
+def t_lora_scaling():
+    """rsLoRA must fall as 1/sqrt(r); the classic convention must not move."""
+    classic = [_lora_scale(r, None, False) for r in (8, 16, 32, 64)]
+    check("classic scale is constant in rank", all(abs(s - 1.0) < 1e-12 for s in classic))
+    rs = [_lora_scale(r, 4.0, True) for r in (8, 16, 32, 64)]
+    check("rsLoRA alpha=4 matches the old scale at rank 16",
+          abs(rs[1] - 1.0) < 1e-12, f"{rs[1]:.4f}")
+    ratios = [rs[i] / rs[i + 1] for i in range(3)]
+    check("rsLoRA halves every 4x rank (sqrt law)",
+          all(abs(x - 2 ** 0.5) < 1e-9 for x in ratios),
+          f"ratios {[round(x,4) for x in ratios]}")
+    check("rsLoRA alpha=8 gives the common scale of 2 at rank 16",
+          abs(_lora_scale(16, 8.0, True) - 2.0) < 1e-12)
+    # resize must carry the convention, not reset to 1.0
+    torch.manual_seed(0)
+    m = Tiny()
+    inject_lora(m, RULES, verbose=False, alpha=4.0, rslora=True)
+    freeze_base(m)
+    merge_and_restart(m)
+    resize_lora(m, [(p, 64) for p, _ in RULES], verbose=False)
+    got = {round(mod.scale, 6) for mod in m.modules() if isinstance(mod, LoRALinear)}
+    check("resize recomputes scale under rsLoRA, not back to 1.0",
+          got == {round(4.0 / 8.0, 6)}, f"scales {got}, expected 0.5 at rank 64")
+
+
 def main():
     print("verifying recently added mechanisms\n")
     t_merge_is_function_preserving(torch.float32, 1e-6)
@@ -232,6 +302,10 @@ def main():
     t_pull_to_init_direction()
     print()
     t_relora_warmup_shape()
+    print()
+    t_fuse_gate_lora()
+    print()
+    t_lora_scaling()
     print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
     return 1 if FAILS else 0
 
