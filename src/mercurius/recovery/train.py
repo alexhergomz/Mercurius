@@ -623,7 +623,9 @@ def main():
     # Adapters are EXCLUDED: their "init" is kaiming/zeros, not a pretrained
     # operator, so pulling them back is ordinary weight decay and not what this
     # is for. Snapshot in bf16 alongside the weights -- ~0.56 GB at 280 M dense.
-    last_merge = 0
+    # sentinel, not 0: at 0 the warmup window covers the first steps of
+    # training, stacking on OneCycle's own warmup before any merge exists
+    last_merge = -10**9
     pull_ref = []
     if a.pull_to_init > 0:
         skip = ("lora_A", "lora_B", "a_lora_A", "a_lora_B", "ls_lambda")

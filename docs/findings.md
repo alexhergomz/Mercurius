@@ -1,10 +1,10 @@
-# Carmenta findings log
+# Mercurius findings log
 
 Running record of what we have **measured**, what the **literature** says, and what
 is still **unproven**. Entries carry the run tag or citation so any claim can be
 traced back. Ordered by confidence, not by date.
 
-Last updated 2026-09-12.
+Last updated 2026-09-13.
 
 ---
 
@@ -145,6 +145,55 @@ not IFT-shaped**. Biderman: LoRA matches full FT on instruction finetuning at
 r=256, but "in CPT, LoRA underperforms full finetuning across all
 configurations." LoLCATs says the same in its own limitations section for
 linearized models (up to 42.4 points on 5-shot MMLU).
+
+### 2.0e Eval noise floor is ZERO, and the adapter-surface sweep (2026-09-13)
+
+Measured before interpreting anything: 5 evaluations of one model and 3 rebuilds
+from the same checkpoint all return ppl@8192 identical to 7 significant figures.
+**sd = 0, spread 0.0000%, both within-model and across-reload.** The evaluation
+pipeline is deterministic, so every difference recorded in this file is real and
+none of them need an error bar.
+
+That retracts a retraction: §1.3's step-100 peak was briefly dismissed as
+possible noise. It is not noise.
+
+Surface sweep, all at seq 8192, 150 steps, live teacher, same init:
+
+| arm | surface | ppl@8192 |
+|---|---|---|
+| `val-full` | dense, 293.91 M | **17.432** |
+| `gate8kv2-lr` | r16 + LoRA lr 2e-4, 54.25 M | 18.450 |
+| `relora-warm` | r16 x5 merges + jagged LR, 54.25 M | 18.609 |
+| `gate8kv2` | r16, 54.25 M | 18.630 |
+| `relora` | r16 x5 merges, NO warmup, 54.25 M | 18.676 |
+| `r64` | rank 64, 65.75 M | 18.826 |
+
+Three readings:
+
+- **Learning rate is the largest lever on a small surface** (0.18), rank
+  accumulation a distant second (0.02), and raising rank outright is NEGATIVE
+  (-0.20). Note rank is confounded with step size here: scale is fixed at 1.0 at
+  every rank, so r64 is also a larger effective step. A clean sweep needs
+  gamma = 4/sqrt(r).
+- **ReLoRA needs its jagged schedule.** Without re-warmup after each merge a
+  restarted adapter enters at zero into a decayed LR, later merges do
+  progressively less, and the final merge lands on the last step and does
+  nothing: 18.676. With warmup 8: 18.609, which overtakes plain r16. The
+  mechanism is real; the margin is 0.11%.
+- **Nothing closes more than 15% of the 1.2-point gap to dense.**
+
+### 2.0f Pre-2026-09-13 checkpoints cannot be reloaded by the fixed code
+
+Discovered while building the noise test. Checkpoints written before the
+double-adapter fix carry BOTH adapters per target -- `mlp.down_proj` has 4 keys
+per layer (`lora_A`, `lora_B`, `base.lora_A`, `base.lora_B`) -- so a single
+injection leaves the inner ones unmatched and `strict=False` drops them in
+silence. A model rebuilt that way reads 20.107 where the run reported 17.432.
+
+Affects `val-full`, `val-ctrl`, `ls8k`, `gate8k`. Their reported numbers stand;
+their weights need the old double injection to reconstruct. Anything reloading
+an old checkpoint must check the key structure first rather than trusting
+`strict=False` to be loud about it.
 
 ### 2.0c-ter Per-OPERATOR rank: in_proj_a is low-rank, the rest are not (2026-09-13)
 
