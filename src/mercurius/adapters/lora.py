@@ -224,11 +224,19 @@ def resize_lora(model, rules, verbose=True):
 
 
 def merged_base_names(model):
-    """Parameter names of bases that absorbed a merge and must be checkpointed."""
+    """Parameter names of bases that absorbed a merge and must be checkpointed.
+
+    Covers both shapes: a LoRALinear still holding its merged base, and a bare
+    module that absorbed one and was then unwrapped (and possibly re-wrapped by
+    a different adapter family). The tag travels with the weight, not with the
+    wrapper, because the wrapper does not survive an adapter swap.
+    """
     out = set()
     for name, mod in model.named_modules():
         if isinstance(mod, LoRALinear) and getattr(mod, "merged", False):
             out.add(f"{name}.base.weight")
+        elif getattr(mod, "_absorbed_merge", False):
+            out.add(f"{name}.weight")
     return out
 
 
@@ -237,8 +245,15 @@ def trainable_parameters(model):
 
 
 def freeze_base(model, also_train=("lora_A", "lora_B", "a_lora_A", "a_lora_B",
-                                   "A_log", "dt_bias")):
-    """Freeze everything, then re-enable adapters and the gate parameters."""
+                                   "A_log", "dt_bias", "pe_c")):
+    """Freeze everything, then re-enable adapters and the gate parameters.
+
+    pe_c is here because the decay-tied phase is created BEFORE this runs, so
+    without it the parameter is frozen, never trains, and never appears in a
+    checkpoint keyed on requires_grad. The phase33 run trained a FIXED c = 1e-2
+    perturbation for 150 steps and reported it as a test of a learned phase.
+    Any new trainable created before freeze_base needs an entry here.
+    """
     for p in model.parameters():
         p.requires_grad_(False)
     n = 0
@@ -246,4 +261,177 @@ def freeze_base(model, also_train=("lora_A", "lora_B", "a_lora_A", "a_lora_B",
         if any(k in name for k in also_train):
             p.requires_grad_(True)
             n += p.numel()
+    return n
+
+
+class VeRALinear(nn.Module):
+    """VeRA (Kopiczko, Blankevoort, Asano, ICLR 2024; arXiv:2310.11454).
+
+        dW = diag(b) . B . diag(d) . A
+
+    A and B are RANDOM, FROZEN and SHARED ACROSS LAYERS; only the two vectors
+    d (length rank) and b (length out_features) are learned, so a layer costs
+    rank + out_features trainable parameters instead of rank*(in+out).
+
+    Rank is therefore nearly free -- going from 16 to 256 adds 240 parameters
+    per layer, not 240*(in+out) -- which is why VeRA is normally run at a rank
+    far above anything sensible for LoRA.
+
+    b is initialized to ZERO so dW = 0 exactly at the start, matching LoRA's
+    zero-init B. d is initialized to a constant (the paper's d_init).
+    """
+
+    def __init__(self, base: nn.Linear, rank: int, shared_A, shared_B,
+                 d_init: float = 0.1):
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+        self.rank = rank
+        self.vera_A = shared_A          # (rank, max_in)   frozen, shared
+        self.vera_B = shared_B          # (max_out, rank)  frozen, shared
+        dev = base.weight.device
+        dt = torch.bfloat16 if base.weight.dtype != torch.float32 else torch.float32
+        self.vera_d = nn.Parameter(torch.full((rank,), d_init, device=dev, dtype=dt))
+        self.vera_b = nn.Parameter(torch.zeros(base.out_features, device=dev, dtype=dt))
+
+    def forward(self, x):
+        out = self.base(x)
+        I, O = self.base.in_features, self.base.out_features
+        h = x.to(self.vera_A.dtype) @ self.vera_A[:, :I].T     # (..., rank)
+        h = h * self.vera_d
+        h = h @ self.vera_B[:O, :].T                           # (..., out)
+        return out + (h * self.vera_b).to(out.dtype)
+
+
+def inject_vera(model, rules, rank=256, d_init=0.1, verbose=True, seed=0):
+    """Wrap matching Linears with VeRA, sharing ONE frozen random pair.
+
+    Sharing is the point, not an optimization: it is what makes the per-layer
+    cost rank + out_features. The shared pair is sized to the largest target and
+    sliced per layer, which is how the paper handles differing shapes.
+    """
+    targets = []
+    seen = set()
+    for mod_name, parent in list(model.named_modules()):
+        for child_name, child in list(parent.named_children()):
+            if not isinstance(child, nn.Linear) or id(child) in seen:
+                continue
+            seen.add(id(child))
+            full = f"{mod_name}.{child_name}" if mod_name else child_name
+            for rule in rules:
+                if full.endswith(rule[0]) and rule[1]:
+                    targets.append((parent, child_name, child, full))
+                    break
+    if not targets:
+        return []
+    max_in = max(c.in_features for _, _, c, _ in targets)
+    max_out = max(c.out_features for _, _, c, _ in targets)
+    ref = targets[0][2].weight
+    dt = torch.bfloat16 if ref.dtype != torch.float32 else torch.float32
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    A = nn.Parameter(torch.empty(rank, max_in, dtype=torch.float32), requires_grad=False)
+    B = nn.Parameter(torch.empty(max_out, rank, dtype=torch.float32), requires_grad=False)
+    nn.init.kaiming_uniform_(A, a=math.sqrt(5), generator=g)
+    nn.init.kaiming_uniform_(B, a=math.sqrt(5), generator=g)
+    A = A.to(ref.device, dt); B = B.to(ref.device, dt)
+    A.requires_grad_(False); B.requires_grad_(False)
+
+    for parent, child_name, child, _ in targets:
+        setattr(parent, child_name, VeRALinear(child, rank, A, B, d_init))
+    if verbose:
+        per = sum(rank + c.out_features for _, _, c, _ in targets)
+        print(f"  VeRA injected into {len(targets)} layers at rank {rank}; "
+              f"{per/1e6:.3f} M trainable (shared A {tuple(A.shape)}, "
+              f"B {tuple(B.shape)} frozen)", flush=True)
+    return targets
+
+
+def merge_vera(model, optimizer=None, reseed=True, seed=0, d_init=0.1,
+               verbose=True):
+    """Fold each VeRA adapter into its base, then RE-DRAW the shared A and B.
+
+        dW = diag(b) . B[:O] . diag(d) . A[:I]
+
+    The re-draw is the point, and it is what makes this different from ReLoRA on
+    LoRA. VeRA's parameter count is not its constraint -- a layer holds only d
+    (rank) and b (out_features) either way. Its constraint is that A and B are a
+    FIXED random subspace: the update can only rescale directions it was handed,
+    and no amount of training escapes that span. Merging and drawing a NEW A, B
+    gives the next cycle an independent subspace, so k cycles accumulate an
+    effective rank of k*rank while never holding more than one cycle's
+    parameters. That attacks the binding constraint rather than the nominal one.
+
+    Two things carried over from merge_and_restart, for the same reasons:
+
+    1. THE OPTIMIZER STATE MUST BE DROPPED for d and b. Adam's moments encode
+       motion within the old random subspace; carried across a re-draw they pull
+       the new vectors back toward directions that no longer exist.
+
+    2. THE MERGED BASE MUST BE SAVED. It is frozen, so a checkpointer keyed on
+       requires_grad will not write it. Unlike the init merge, this one is NOT
+       replayable -- it depends on the trained d and b at the moment of merging,
+       which are then reset -- so a run that merges and saves adapters only
+       produces a checkpoint that cannot be rebuilt at all. train_recovery
+       refuses that combination rather than discovering it at eval time.
+    """
+    mods = [m for m in model.modules() if isinstance(m, VeRALinear)]
+    if not mods:
+        return 0
+    with torch.no_grad():
+        for mod in mods:
+            I, O = mod.base.in_features, mod.base.out_features
+            A = mod.vera_A[:, :I].float()
+            B = mod.vera_B[:O, :].float()
+            dW = mod.vera_b.float().unsqueeze(1) * ((B * mod.vera_d.float()) @ A)
+            mod.base.weight.data += dW.to(mod.base.weight.dtype)
+            mod.base._absorbed_merge = True
+            mod.vera_b.zero_()
+            mod.vera_d.fill_(d_init)
+            if optimizer is not None:
+                for p_ in (mod.vera_b, mod.vera_d):
+                    optimizer.state.pop(p_, None)
+        if reseed:
+            # A and B are shared, so redraw each distinct tensor once
+            seen = set()
+            for mod in mods:
+                for tensor in (mod.vera_A, mod.vera_B):
+                    if id(tensor) in seen:
+                        continue
+                    seen.add(id(tensor))
+                    buf = torch.empty(tensor.shape, dtype=torch.float32)
+                    g = torch.Generator(device="cpu").manual_seed(seed)
+                    nn.init.kaiming_uniform_(buf, a=math.sqrt(5), generator=g)
+                    tensor.data.copy_(buf.to(tensor.device, tensor.dtype))
+                    seed += 1
+    if verbose:
+        print(f"  VeRA merged into {len(mods)} bases"
+              f"{' and A/B re-drawn' if reseed else ''}", flush=True)
+    return len(mods)
+
+
+def unwrap_lora(model, patterns):
+    """Replace matching LoRALinear wrappers with their base module.
+
+    Only safe after merge_and_restart, which folds each adapter's delta into its
+    base -- otherwise the delta is discarded. Used to swap one adapter family
+    for another on a subset of modules without losing the initialization they
+    were carrying.
+    """
+    n = 0
+    for mod_name, parent in list(model.named_modules()):
+        for child_name, child in list(parent.named_children()):
+            if not isinstance(child, LoRALinear):
+                continue
+            full = f"{mod_name}.{child_name}" if mod_name else child_name
+            if any(full.endswith(p) for p in patterns):
+                # Carry the merge tag onto the base. Unwrapping destroys the
+                # LoRALinear that merged_base_names looks for, so without this
+                # the folded delta is trained, evaluated, and then silently
+                # dropped at save time -- which is exactly what merge_and_restart
+                # documents as the failure to avoid, reintroduced one layer up.
+                if getattr(child, "merged", False):
+                    child.base._absorbed_merge = True
+                setattr(parent, child_name, child.base)
+                n += 1
     return n

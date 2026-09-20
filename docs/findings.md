@@ -48,6 +48,112 @@ Three readings:
 **Rule for future evaluation: always include the unmodified original as an arm.**
 `src/eval_retrieval_ab.py` takes `original=ORIGINAL` for this.
 
+### 0.1 Correction: "dense KDA is required" is not supported (2026-09-14)
+
+Stated as a verdict, retracted. The measurement:
+
+| arm | KDA projections | trainable | best ppl@8192 | vs ORIGINAL |
+|---|---|---|---|---|
+| `longdoc-c` | dense | 283.88 M | 17.010 | **-6.95%** |
+| `gatelong-r64` | LoRA r64 | 69.29 M | 17.594 | **-3.78%** |
+| `gatelong-r128` | LoRA r128 | 84.62 M | 17.668 | -3.38% |
+
+**Both beat the original.** The trade is 4.1x fewer trainable parameters for
+3.2% less improvement -- a cost decision, not a requirement, and for larger
+members of the family 69 M against 284 M is the difference between feasible and
+not. Calling it "required" repeated the framing error §0 already corrects: an
+internal comparison used as a verdict.
+
+What IS supported: rank is not the binding constraint on that surface. Rank 128
+is worse than 64, and the LoRA arms degrade faster from their peak (3.45% and
+3.21% against dense's 1.83%), so they are overfitting sooner rather than running
+out of capacity. Whether the constraint is step size is untested -- everything
+ran at scale 1.0, half the scale 2 that Biderman and LoLCATs use.
+
+### 0.2 Correction: the VeRA result does not generalise
+
+§ "VeRA is ruled out" was measured by fitting VeRA's parameterization to
+`linear_attn.out_proj` and `in_proj_qkv` -- the KDA projections, the most
+damaged matrices in the model. It says nothing about the FFN, which is where
+VeRA is normally used and where its own evidence lives. The claim was reported
+without that scope.
+
+Relative update magnitude on `longdoc-c`, measured properly (an earlier attempt
+silently skipped every LoRA-wrapped dense weight, because those live at
+`<module>.base.weight` and the base-key mapping did not resolve it):
+
+| group | mean ‖dW‖/‖W‖ |
+|---|---|
+| KDA | 0.00534 |
+| attention | 0.01066 |
+| **FFN** | **0.01336** |
+
+The FFN carries the LARGEST relative update, which cuts against the expectation
+that damage confined to attention leaves the FFN with little to do. Magnitude is
+not necessity, though: the repair need not happen where the damage is, and the
+FFN may simply be the cheapest place to compensate. `--freeze-ffn` tests it.
+
+---
+
+## 0.3 Correction: the retrieval metric was confounded (2026-09-19)
+
+`gain = NLL(needle, 1st occurrence) - NLL(needle, 2nd occurrence)` was reported
+as "retrieval". It is a difference of two quantities that both move, and
+decomposing it reverses the conclusion. Recall is the SECOND term alone; the
+first term is the model's unconditional surprise at 16 random token IDs, which
+adaptation also changes.
+
+| arm | 1st@4k | 2nd@4k | gain@4k | 1st@16k | 2nd@16k | gain@16k |
+|---|---|---|---|---|---|---|
+| original | 15.478 | 1.991 | 13.487 | 15.471 | 2.782 | 12.689 |
+| dense-283M | 15.725 | **1.945** | 13.781 | 15.726 | **2.779** | 12.947 |
+| all-VeRA | 15.505 | 1.980 | 13.525 | 15.490 | 2.857 | 12.633 |
+| all-VeRA + data | **15.215** | 2.013 | 13.202 | 15.206 | 2.865 | 12.341 |
+
+- dense's gain@4k looked **+0.293 better**. Its actual recall improved **0.046**;
+  the rest is its unconditional NLL rising 0.247 — it got *worse* at the term
+  being subtracted.
+- all-VeRA+data's gain@4k looked **0.285 worse**. Its recall is **0.021** worse;
+  the rest is its unconditional NLL falling 0.264 — a *better* prior, penalised
+  by the metric.
+
+**Read on the second term only:** at 4k all three converted arms sit within
+±0.05 nats of the original. At 16k dense is at parity (2.779 vs 2.782) and the
+two VeRA arms are ~0.08 worse. At 1k every converted arm is 0.34-0.47 worse,
+which is non-monotonic in gap and not resolvable at n=1 (below).
+
+Retracts: "the data term costs retrieval". It does not, measurably.
+
+### 0.3b What the probe is, and is not
+
+It is a **verbatim-copy / associative-recall** probe, not NIAH: 16 random token
+IDs (one draw, seed 7), inserted at a fixed position 128, repeated after `gap`
+tokens, scored by NLL. No question, no answer, no judge, no depth sweep. That
+family is the right one here -- fixed-state models fail specifically at recall
+and copying (Zoology/MQAR arXiv:2312.04927; Based arXiv:2402.18668; "Repeat
+After Me" arXiv:2402.01032), and KDA is a gated delta rule precisely to fix
+recall (Gated DeltaNet arXiv:2412.06464). NLL rather than generated-answer
+accuracy is also right at 0.8B, where generative NIAH at 16k would floor at ~0
+and yield no signal.
+
+Design faults, ranked:
+
+1. **Gap is conflated with total length.** `seq = 128 + 16 + gap + 16`, so
+   gain@16k is measured at ~16.4k context and gain@1k at ~1.2k. Comparing
+   ACROSS gaps mixes distance-to-needle with context length. Comparing across
+   ARMS at one fixed gap is sound -- every arm sees a byte-identical input.
+2. **One depth.** The needle always sits at ~1.5% depth, so any
+   lost-in-the-middle behaviour is invisible.
+3. **n = 1 needle.** A single 16-token draw, one seed, no error bars. The
+   0.0000% spread in §2.0e is *reload* determinism and does NOT license this:
+   it says a re-run gives the same number, not that the number is stable across
+   needles. Differences of ~0.05 nats are not resolvable.
+4. Needle IDs are drawn from 5000-60000 of a 248,320 vocabulary, i.e. the low
+   24%, skewing toward frequent BPE tokens.
+
+Index arithmetic was checked and is correct (`logits[p-1 : p-1+nl]` against
+`seq[p : p+nl]`).
+
 ---
 
 ## 1. Measured — headline results
@@ -578,6 +684,75 @@ A hardcoded name filter silently discarded `in_proj_a`'s **37.7 M** dense
 params — the run trained them, the eval curve showed the benefit, the weights
 were dropped on save.
 
+### 4.4b `requires_grad` is not the trained state either (2026-09-19)
+
+§4.4 fixed the *save filter*. It did not fix what the filter can see. Two kinds
+of weight are **changed and frozen**, so `requires_grad` misses them:
+
+1. **A base that absorbed a merge.** `merge_and_restart` folds the adapter delta
+   into the base and freezes it. Covered by `merged_base_names`, but only after
+   the tag was moved onto the weight (`_absorbed_merge`) — `unwrap_lora`
+   destroys the wrapper that used to carry it.
+2. **`in_proj_a` after `fuse_gate_lora`.** It folds the in-class gate adapter
+   into the dense weight; the next adapter to wrap it re-freezes it. It set no
+   tag at all, so the fold was unsaveable. Now tagged.
+
+`save_resume` had the same bug independently: it filtered on `requires_grad`
+alone, so resuming restored **unmerged** weights — a different model, silently.
+
+**The failure mode is what makes this expensive.** Nothing is *missing* from the
+rebuilt model's point of view: every tensor loads, `strict=False` reports
+nothing, and the bases simply hold the wrong values. The only symptom is a
+perplexity that disagrees with the run. `allvera` read **22.609 instead of
+17.861** for a day and was written off as a bad configuration.
+
+### 4.4c A trained checkpoint is recoverable even when incomplete (2026-09-19)
+
+The weights a run folded in and froze are a **deterministic function of files
+still on disk** — stage-AB plus the init delta — not information that existed
+only in memory. So an incomplete checkpoint does not need retraining; it needs
+the startup sequence replayed:
+
+    inject_lora(ranks read from the INIT checkpoint) -> load it
+      -> merge_and_restart -> unwrap at rank 0 -> fuse_gate_lora
+      -> merge_and_restart -> inject_vera -> convert_to_mla
+      -> load the trained tensors
+
+Verified exactly, not approximately. `src/verify_checkpoint.py` rebuilds a
+checkpoint and re-runs the trainer's own eval against the perplexity that run
+logged:
+
+| len | run | rebuilt | rel |
+|---|---|---|---|
+| 2048 | 11.736534 | 11.736534 | +0.0000% |
+| 8192 | 15.962002 | 15.962002 | +0.0000% |
+
+Two things had to be right for it to be *exact* rather than merely close:
+
+- **Replay order is the trainer's order.** Unwrapping only the VeRA targets
+  leaves the others wrapped, and their weights then live at
+  `<target>.base.weight`, matching no checkpoint key.
+- **Restore the dtype the run used.** The trainer promotes trainable norm gains
+  to fp32 (§4.3); 79 tensors were saved as fp32 and loaded into bf16
+  parameters. The truncation alone cost **+0.15% at 2048** — invisible as
+  "noise" on a machine whose eval has none (§2.0e), which is exactly why it had
+  to be driven to 0.0000%.
+
+### 4.4d `--init-adapters` cannot load a trained checkpoint (2026-09-19)
+
+Init adapters load **before** VeRA injection and MLA conversion, by design —
+their delta must be folded into the factorization rather than discarded by it. A
+trained checkpoint must load **after**, or its `vera_d`/`vera_b`/latents land on
+modules that do not exist yet and `strict=False` drops all 330. `--resume`
+already loads in the right place; `--init-adapters` does not. A round-trip test
+that rebuilt via `--init-adapters` would have reported a failure that said
+nothing about the checkpoint.
+
+Resume snapshots were also written only inside `evaluate()`, so recoverability
+was tied to `--eval-every` (default **150**): a 150-step run wrote one resume
+file, at the end. Now `--resume-every` (default 25) is independent — an eval is
+two full 8192 forwards, a resume write is a 1.1 GiB overwrite.
+
 ### 4.5 Other silent failures
 
 - **Stale length-mix cap** fired for `--live-teacher`, truncating the mix to
@@ -590,7 +765,13 @@ were dropped on save.
 - **`ps -eo args | grep "[t]rain_recovery.py"` self-matches the shell.** Match on
   `comm == python`. A too-narrow process check (capped output) caused a
   GPU collision on 2026-09-12 that OOMed a launch.
-- **Never `pkill -f`.** Kill by explicit numeric PID.
+- **Never `pkill -f`, and never match on ARGS at all.** Kill by explicit numeric
+  PID obtained from `ps -eo pid,comm=` with `comm == python`. Matching on args --
+  including with the `[t]rain` bracket trick -- kills the shell running the
+  command, because that shell's own command line contains the pattern as part of
+  a later `grep`/`sed` argument. This happened three times on 2026-09-20 alone,
+  the third time taking down a training run and all three queue wrappers. The
+  bracket trick hides the `awk`, not the parent.
 
 ---
 

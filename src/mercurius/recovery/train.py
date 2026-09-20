@@ -27,9 +27,9 @@ from mercurius.models.kda import (load_kda_model, enable_state_passing, reset_st
                        promote_state, fuse_gate_lora)
 from mercurius.surgery.norm_fusion import get_trunk
 from mercurius.surgery.rope_dial import install_rope_dial
-from mercurius.adapters.lora import (inject_lora, freeze_base, trainable_parameters,
+from mercurius.adapters.lora import (inject_lora, freeze_base, trainable_parameters, merge_vera,
                   merge_and_restart, merged_base_names, resize_lora,
-                  rules_from_checkpoint)
+                  rules_from_checkpoint, inject_vera, unwrap_lora)
 from mercurius.eval.characterize import perplexity
 from mercurius.eval.suite import ce_and_topk, sample, report, PROMPTS
 import bitsandbytes as bnb
@@ -88,10 +88,15 @@ def kl_loss(student_logits, teacher_logits, chunk=512, temperature=1.0):
     return loss / max(n, 1)
 
 
+import math
+
+LOG2 = math.log(2.0)
+CE_EPS = 1e-4
+
 from torch.utils.checkpoint import checkpoint
 
 
-def save_trainable(model, path):
+def save_trainable(model, path, save_bases=False):
     """Save exactly the parameters that were trained.
 
     The previous filter was a hardcoded name tuple, which goes stale the moment
@@ -105,8 +110,18 @@ def save_trainable(model, path):
     Keying off requires_grad cannot go stale.
     """
     names = {n for n, p in model.named_parameters() if p.requires_grad}
-    # A merged base is frozen but CHANGED -- requires_grad cannot see it.
-    names |= merged_base_names(model)
+    # A merged base is frozen but CHANGED, so requires_grad cannot see it -- but
+    # storing it is the wrong fix. It is 0.91 GB of a 0.92 GB checkpoint, 99% of
+    # the file, and it is DETERMINISTIC: stage-AB plus the init delta, replayed
+    # identically by build(). A checkpoint written without it rebuilt to
+    # +0.0000% (adapters-allvera-ce-best.pt, 0.01 GB). Saving it made every
+    # checkpoint 92x larger for nothing.
+    #
+    # The cost is a dependency: ckpt/qwen3.5-0.8b-stageAB and
+    # ckpt/adapters-combined.pt become load-bearing for every checkpoint that
+    # omits the bases. Pass --save-merged-bases to make a self-contained copy.
+    if save_bases:
+        names |= merged_base_names(model)
     sd = model.state_dict()
     torch.save({k: sd[k].detach().cpu() for k in sorted(names) if k in sd}, path)
     return len(names)
@@ -130,6 +145,132 @@ def _chunk_kl_terms(h_c, W_lm, tv_c, ti_c, lam, use_taid):
     s_sel = torch.einsum("cd,ckd->ck", h_c, W_lm[ti_c.long()].to(h_c.dtype))
     return (taid_kl_terms(s_sel, tv_c, lam) if use_taid
             else topk_kl_terms(s_sel, tv_c))
+
+
+def _chunk_div_terms(h_s_c, h_t_c, W_lm, mode="forward", lam=1.0,
+                     tgt_c=None, ce_beta=1.0, ce_mix=0.0):
+    """Per-position divergence between student and teacher, full vocabulary.
+
+    Both distributions are available explicitly here, so every one of these is
+    a direct expression -- no sampling, no estimator, same cost as forward KL.
+    That is unusual: reverse KL normally needs samples from the student (MiniLLM
+    uses policy gradients for exactly this), and it is only cheap because the
+    live teacher already gives us the full logits.
+
+      forward  KL(t || s)   mode-covering. The student must put mass wherever
+                            the teacher does, so a student that CANNOT represent
+                            the teacher spreads itself thin to cover it.
+      reverse  KL(s || t)   mode-seeking. The student concentrates on a subset
+                            of the teacher's modes and ignores the rest --
+                            arguably the right objective when the student is
+                            structurally incapable of matching, which is exactly
+                            our case: linear attention, 4x compressed KV, NoPE.
+      js                    symmetric, bounded, no mode preference.
+      taid                  target interpolated from the student's OWN current
+                            distribution toward the teacher as lam goes 0 -> 1,
+                            so the target is always reachable from where the
+                            student is.
+
+    THE GROUND-TRUTH TERM IS MIXED INTO THE TARGET, not added as a second
+    loss. CE is exactly forward KL against a one-hot: KL(delta_y || p_s) =
+    -log p_s(y). So it is already the same object in the same units -- but only
+    for forward. KL(p_s || delta_y) is infinite, so reverse cannot take a
+    one-hot target at all, and a separately weighted CE would silently mean
+    something different in each mode.
+
+    Mixing the target instead,
+
+        q = (1 - w) * p_teacher + w * delta_y
+
+    fixes all of it: q inherits the teacher's full support so reverse is finite,
+    the magnitude is automatically the teacher term's because it IS the teacher
+    term with a perturbed target, and w = 0 recovers the current objective
+    exactly. w is then an interpretable interpolation between "match the
+    teacher" and "match the data" rather than a coefficient needing a scale
+    hunt.
+
+    This is also the only mechanism here that can exceed the teacher. Pure
+    distillation caps the student at teacher quality by construction; the data
+    term is what lets it win where the teacher and the corpus disagree.
+
+    NOT Wasserstein. It needs a ground metric over the vocabulary, and there
+    isn't a principled one for tokens -- embedding distance is a choice, not a
+    fact. Even granting one, the cost matrix is 248,320^2. Sinkhorn on a
+    truncated support is conceivable but it is a research project, not a flag.
+    """
+    lg_t = (h_t_c @ W_lm.T).float()
+    t_lp = F.log_softmax(lg_t, -1)
+    del lg_t
+    lg_s = (h_s_c @ W_lm.T).float()
+    s_lp = F.log_softmax(lg_s, -1)
+    del lg_s
+    # TAID: walk the target from the student's own distribution to the
+    # teacher's. lam = 1 leaves t_lp untouched, so every mode is bit-identical
+    # to pure distillation when TAID is off.
+    # Data mixed INTO THE TARGET. This is not a scale fix, it is a shape fix.
+    #
+    # The additive form below (ce_beta) adds D(y||s) - D(y||t) for a near-one-hot
+    # y. In FORWARD mode that is ordinary cross-entropy, -log p_s(y): it raises
+    # the mass on the true token and leaves the rest of the distribution free.
+    # In REVERSE mode the same term is KL(s||y), which is minimised ONLY when
+    # p_s = y -- that is, when the student becomes a POINT MASS. It is an
+    # entropy-collapse objective wearing a cross-entropy costume.
+    #
+    # Demonstrated by direct minimisation over a free distribution:
+    #     reverse vs smoothed one-hot -> student entropy 0.0000 nats, p(y)=1.0000
+    #     reverse vs mixed target q   -> student entropy 9.6918 nats, p(y)=0.1000
+    # (teacher entropy 10.409 nats). Measured on the real model, reverse+ce_beta=1
+    # ran ppl@8192 20.377 -> 23.939 -> 104.972 in 100 steps while top-1 held at
+    # 41.9%: exactly a collapsed, over-confident distribution.
+    #
+    # q = (1-W) p_teacher + W delta_y keeps the teacher's support AND its entropy,
+    # so there is nothing to collapse toward and the term is portable across
+    # divergences. W = 0 recovers pure distillation bit-exactly.
+    if ce_mix > 0.0 and tgt_c is not None:
+        V = t_lp.shape[-1]
+        y = torch.full_like(t_lp, CE_EPS / V)
+        y.scatter_(-1, tgt_c.view(-1, 1).long(), 1.0 - CE_EPS + CE_EPS / V)
+        q = (1.0 - ce_mix) * t_lp.exp() + ce_mix * y
+        t_lp = (q / q.sum(-1, keepdim=True).clamp_min(1e-9)).clamp_min(1e-9).log()
+    # TAID walks from the student's own distribution toward THAT target, so the
+    # mix is applied first: the target is the thing being approached.
+    if lam < 1.0:
+        q0 = (1.0 - lam) * s_lp.exp().detach() + lam * t_lp.exp()
+        t_lp = (q0 / q0.sum(-1, keepdim=True).clamp_min(1e-9)).clamp_min(1e-9).log()
+    def D(a_lp, b_lp):
+        """Divergence from target a to model b, in nats, in the chosen mode."""
+        if mode == "forward":
+            return (a_lp.exp() * (a_lp - b_lp)).sum(-1)
+        if mode == "reverse":
+            return (b_lp.exp() * (b_lp - a_lp)).sum(-1)
+        if mode == "js":
+            m = torch.logaddexp(a_lp, b_lp) - LOG2
+            return 0.5 * ((a_lp.exp() * (a_lp - m)).sum(-1)
+                          + (b_lp.exp() * (b_lp - m)).sum(-1))
+        raise ValueError(mode)
+
+    out = D(t_lp, s_lp)
+    if ce_beta != 0.0 and tgt_c is not None:
+        # The data term, expressed as EXCESS over the teacher:
+        #
+        #     D(y || student) - D(y || teacher)
+        #
+        # Same divergence, same units, and exactly zero when the student equals
+        # the teacher -- so it sits on the first term's scale by construction
+        # and beta = 1 is meaningful rather than a number someone picked. It
+        # goes NEGATIVE when the student beats the teacher on the true token,
+        # which is the only mechanism here that can pass the teacher at all:
+        # pure distillation caps the student at teacher quality.
+        #
+        # y is smoothed by eps toward uniform purely so reverse KL is finite --
+        # D(y || p) with a hard one-hot is infinite in that direction, which is
+        # why a plain CE term cannot be swapped between divergences.
+        V = s_lp.shape[-1]
+        y_lp = torch.full_like(s_lp, math.log(CE_EPS / V))
+        y_lp.scatter_(-1, tgt_c.view(-1, 1).long(),
+                      math.log(1.0 - CE_EPS + CE_EPS / V))
+        out = out + ce_beta * (D(y_lp, s_lp) - D(y_lp, t_lp))
+    return out
 
 
 def _chunk_fullkl_terms(h_s_c, h_t_c, W_lm):
@@ -171,7 +312,7 @@ def _chunk_ce_terms(h_c, W_lm, tgt_c):
     return F.cross_entropy((h_c @ W_lm.T).float(), tgt_c, reduction="none")
 
 
-def save_resume(path, model, opt, sched, step, gens):
+def save_resume(path, model, opt, sched, step, gens, save_bases=False):
     """Everything needed to continue a run exactly where it stopped.
 
     Weight checkpoints alone are NOT resumable: restarting from them re-inits the
@@ -183,9 +324,20 @@ def save_resume(path, model, opt, sched, step, gens):
     Written once per eval and OVERWRITTEN, so it costs a constant ~1.1 GiB rather
     than growing with the number of evals.
     """
+    # requires_grad alone is not the trained state: a base that absorbed a merge
+    # is frozen and changed, so resuming from a requires_grad-only snapshot
+    # restarts from unmerged weights -- a different model, silently.
+    _keep = {n for n, p in model.named_parameters() if p.requires_grad}
+    _sd = model.state_dict()
+    if save_bases:
+        # Off by default for the same reason as save_trainable: the bases are a
+        # deterministic replay of stage-AB plus the init delta, and storing them
+        # is what made a resume file 0.94 GB instead of ~30 MB. A resumed run
+        # rebuilds the structure before loading this, so the replay has already
+        # happened by the time these weights land.
+        _keep |= {n for n in merged_base_names(model) if n in _sd}
     torch.save({"step": step,
-                "weights": {n: p.detach().cpu() for n, p in model.named_parameters()
-                            if p.requires_grad},
+                "weights": {n: _sd[n].detach().cpu() for n in sorted(_keep)},
                 "opt": opt.state_dict(),
                 "sched": sched.state_dict(),
                 "gens": {k: g.get_state() for k, g in gens.items()}}, path)
@@ -346,6 +498,40 @@ def main():
     ap.add_argument("--seq", type=int, default=2048)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--eval-every", type=int, default=150)
+    ap.add_argument("--ce-mix", type=float, default=0.0, metavar="W",
+                    help="mix the ground truth INTO the distillation target with "
+                         "weight W in [0,1]: q = (1-W)*p_teacher + W*onehot. "
+                         "Unlike --ce-beta this carries the teacher term's own "
+                         "scale, so it is portable across divergences; --ce-beta "
+                         "in reverse mode is ~216x data-dominated and diverges")
+    ap.add_argument("--synth-data", default=None, metavar="PATH",
+                    help="extra corpus of synthetic multi-item recall documents "
+                         "(src/synth_recall.py). Appended to the document pool, so "
+                         "the mix fraction is its share of SPANS")
+    ap.add_argument("--save-merged-bases", action="store_true",
+                    help="also store the merged base weights in the checkpoint. "
+                         "They are 99%% of the file and are replayable from "
+                         "stage-AB plus --init-adapters, so this is only for a "
+                         "self-contained copy that survives losing those files")
+    ap.add_argument("--phq-lr", type=float, default=1e-3,
+                    help="learning rate for the per-head query maps. Separate "
+                         "from --lr and --vera-lr: R is identity-initialised, so "
+                         "3e-5 leaves it 0.42%% off identity after 150 steps and "
+                         "1e-2 can erase the identity entirely")
+    ap.add_argument("--per-head-q", action="store_true",
+                    help="give every query head its own effective key via a "
+                         "per-head map on q (equivalent to widening up_k). "
+                         "Identity at init; 3.15 M params, cache and FLOPs unchanged")
+    ap.add_argument("--gdn2", action="store_true",
+                    help="lift the KDA layers to Gated DeltaNet-2 (arXiv:2605.22791): "
+                         "the scalar write gate becomes a channel-wise erase gate "
+                         "on keys and write gate on values. Exact at init.")
+    ap.add_argument("--decay-phase", type=float, default=None, metavar="C",
+                    help="enable the decay-tied rotary phase on the linear-attention "
+                         "layers with this init for c (0 is the identity)")
+    ap.add_argument("--resume-every", type=int, default=25, metavar="N",
+                    help="write the resume file every N steps, independent "
+                         "of --eval-every (0 disables)")
     ap.add_argument("--state-passing", action="store_true",
                     help="carry KDA recurrent state across contiguous segments")
     ap.add_argument("--ramp-seq", action="store_true",
@@ -366,7 +552,24 @@ def main():
                     help="how many tokens to cache; guards against filling the "
                          "root filesystem, which can brick a Jetson")
     ap.add_argument("--taid", action="store_true",
-                    help="TAID: KL to a time-interpolated student/teacher target")
+                    help="ramp the target from the student's OWN distribution "
+                         "to the teacher's over training (Shing et al.). "
+                         "Orthogonal to --divergence: it changes WHAT the target "
+                         "is, not which divergence measures the gap. Needs --ce-mix > 0, since at lambda=0 the target is the student itself and the "
+                         "divergence sits at its minimum with zero gradient.")
+    ap.add_argument("--ce-beta", type=float, default=1.0,
+                    help="weight on the data term, which is expressed as EXCESS "
+                         "nats over the teacher: D(y||student) - D(y||teacher), "
+                         "in whatever divergence --divergence selects. Zero when "
+                         "the student equals the teacher, negative when it beats "
+                         "it, so beta=1 is principled rather than a tuned "
+                         "constant. 0 gives pure distillation, which caps the "
+                         "student at teacher quality.")
+    ap.add_argument("--divergence", default="forward",
+                    choices=["forward", "reverse", "js"],
+                    help="output-loss divergence. forward KL is mode-covering "
+                         "and makes an incapable student spread its mass; "
+                         "reverse is mode-seeking and lets it concentrate.")
     ap.add_argument("--lm-weight", type=float, default=0.0,
                     help="teacher-free CE term; distillation alone caps the "
                          "student at teacher quality")
@@ -401,7 +604,7 @@ def main():
                          "in_proj_a is the only term that makes the decay vary "
                          "per channel WITH CONTENT, and it is tiled from GDN's "
                          "per-head rows and frozen. Measured: the rank-32 gate "
-                         "LoRA moved it by only 1.8% of its norm in 2.46M "
+                         "LoRA moved it by only 1.8%% of its norm in 2.46M "
                          "tokens, so the diagonal never really forms. ~37.7M params.")
     ap.add_argument("--train-attn", action="store_true",
                     help="dense-train ALL linear_attn and self_attn parameters "
@@ -411,7 +614,7 @@ def main():
                          "params/token.")
     ap.add_argument("--train-norms", action="store_true",
                     help="unfreeze every normalization gain. Costs 0.05M params "
-                         "(0.006% of the model), so this is nearly free.")
+                         "(0.006%% of the model), so this is nearly free.")
     ap.add_argument("--allow-plain-svd", action="store_true",
                     help="permit an MLA conversion without covariances. Off by "
                          "default because plain SVD is known-worse here and the "
@@ -442,6 +645,36 @@ def main():
     ap.add_argument("--head-chunk", type=int, default=2048,
                     help="positions per lm_head chunk in the cached-KL path; "
                          "bounds peak head memory independently of seq length")
+    ap.add_argument("--vera-all", type=int, default=0, metavar="RANK",
+                    help="adapt EVERY adapted matrix with VeRA at RANK -- the "
+                         "KDA projections including in_proj_a, attention q/o, "
+                         "and the FFN. Only the MLA latent stays dense (already "
+                         "low rank), plus the parts no adapter applies to: the "
+                         "diagonal, the depthwise conv, in_proj_b, norms. "
+                         "~4.5 M trainable, 63x smaller than dense KDA. Rank is "
+                         "nearly free here (4.49 M at 256, 4.61 M at 1024).")
+    ap.add_argument("--vera-lr", type=float, default=None,
+                    help="learning rate for the VeRA vectors. They start at zero and are pure scalings, so they do not move at a dense rate.")
+    ap.add_argument("--lora-tiled", type=int, default=0, metavar="RANK",
+                    help="adapt in_proj_a (the tiled decay projection) with "
+                         "LoRA at RANK instead of training it densely. It is "
+                         "37.75 M dense -- 64%% of the whole lean budget -- and "
+                         "its measured update needs rank 22-26, so r64 leaves 3x "
+                         "headroom over what it actually uses. 0 = dense.")
+    ap.add_argument("--vera-ffn", action="store_true",
+                    help="adapt mlp.* with VeRA instead of LoRA. Rank is nearly "
+                         "free in VeRA (rank + out_features per layer, on a "
+                         "shared frozen random pair), so this is run at a much "
+                         "higher rank than LoRA would be.")
+    ap.add_argument("--vera-rank", type=int, default=256)
+    ap.add_argument("--vera-d-init", type=float, default=0.1)
+    ap.add_argument("--freeze-ffn", action="store_true",
+                    help="do not adapt mlp.* at all. The surgery damages the "
+                         "attention path, and several TransMLA-style pipelines "
+                         "leave the FFN alone. Measured here the FFN carries the "
+                         "LARGEST relative update (0.0134 vs 0.0053 for KDA), but "
+                         "magnitude is not necessity -- this flag is how to find "
+                         "out whether it is doing work or merely able to move.")
     ap.add_argument("--train-data", default=None,
                     help="override the training corpus. data/fineweb_edu_long.txt\n"
                          "holds 30.0 M tokens in 3,522 documents averaging 8,519\n"
@@ -510,6 +743,25 @@ def main():
     ap.add_argument("--tag", default="run")
     a = ap.parse_args()
 
+    # Argument consistency, checked BEFORE anything touches the GPU.
+    if a.divergence in ("reverse", "js") and a.ce_beta and not a.ce_mix:
+        raise SystemExit(
+            f"--divergence {a.divergence} with --ce-beta {a.ce_beta} collapses "
+            "the student. The additive data term is KL(student || near-one-hot) "
+            "in reverse mode, which is minimised only by a POINT MASS: direct "
+            "minimisation drives entropy to 0.0000 nats. Measured on this model, "
+            "ppl@8192 went 20.377 -> 23.939 -> 104.972 in 100 steps while top-1 "
+            "held at 41.9%. Use --ce-mix W instead: mixing the target keeps the "
+            "teacher's entropy (9.69 of 10.41 nats at W=0.1) so there is nothing "
+            "to collapse toward.")
+    if a.relora_every and not a.save_merged_bases:
+        raise SystemExit(
+            "--relora-every merges adapters into the frozen bases mid-run, and "
+            "that merge is NOT replayable: it depends on the trained factors at "
+            "the moment of merging, which are then reset. Saving adapters only "
+            "would produce a checkpoint that cannot be rebuilt at all. Re-run "
+            "with --save-merged-bases (about 0.95 GB per checkpoint).")
+
     torch.manual_seed(0)
     tok = AutoTokenizer.from_pretrained(CKPT)
     # DIFFERENT corpora: training on the eval set would make perplexity measure
@@ -517,6 +769,19 @@ def main():
     train_path = a.train_data or TRAIN_DATA
     if a.doc_aware:
         train_ids, doc_spans = tokenize_by_document(tok, train_path, a.seq)
+        if a.synth_data:
+            # Appended, not substituted. batches() picks a span UNIFORMLY, so the
+            # synthetic share of draws is n_synth_spans / total_spans -- not the
+            # token share, which would be far smaller since these documents are
+            # only ~9k tokens each.
+            s_ids, s_spans = tokenize_by_document(tok, a.synth_data, a.seq)
+            off = int(train_ids.numel())
+            n_nat = len(doc_spans or [])
+            doc_spans = (doc_spans or []) + [(s + off, e + off) for s, e in s_spans]
+            train_ids = torch.cat([train_ids, s_ids])
+            print(f"  synthetic multi-item data: {len(s_spans)} spans added to "
+                  f"{n_nat}; {len(s_spans)/max(len(doc_spans),1):.1%} of sampled "
+                  f"windows will require multi-fact retention", flush=True)
     else:
         train_ids = tok(open(train_path).read(), return_tensors="pt").input_ids[0]
         doc_spans = None
@@ -558,6 +823,22 @@ def main():
     keep, policy = {"nope": (0, "global"), "c1": (16, "local"),
                     "c0": (32, "local")}[a.dial]
     install_rope_dial(student, keep, policy)
+    if a.gdn2:
+        # BEFORE adapters. from_kda copies submodules by state_dict, and a
+        # LoRA/VeRA-wrapped projection has a different structure, so lifting an
+        # already-adapted model would throw or silently drop the adapter.
+        from mercurius.models.gdn2 import convert_to_gdn2
+        convert_to_gdn2(student)
+    if a.decay_phase is not None:
+        from mercurius.models.kda import Qwen3_5KDAGatedDeltaNet as _KDA
+        _n = 0
+        for _l in (student.model.language_model if hasattr(student.model, "language_model")
+                   else student.model).layers:
+            _la = getattr(_l, "linear_attn", None)
+            if isinstance(_la, _KDA):
+                _la.enable_decay_phase(a.decay_phase); _n += 1
+        print(f"  decay-tied phase enabled on {_n} linear-attention layers "
+              f"(c init {a.decay_phase:g}); MLA layers stay NoPE", flush=True)
 
     if a.state_passing:
         n_sp = enable_state_passing(student)
@@ -577,10 +858,37 @@ def main():
     # silently discarded -- which is how --kda-rank printed "rank -> 64" and
     # trained rank 16.
     rules = LORA_RULES
+    if a.freeze_ffn or a.vera_ffn:
+        rules = [(r[0], 0) + tuple(r[2:]) if r[0].startswith('mlp.') else r
+                 for r in rules]
+        print('  FFN frozen: no adapter on mlp.*', flush=True)
+    VERA_ALL = ["linear_attn.in_proj_qkv", "linear_attn.in_proj_z",
+                "linear_attn.out_proj", "linear_attn.in_proj_a",
+                # GDN-2's channel-wise erase/write gates. Tiled at init (every
+                # channel in a head shares one row), which is the structure the
+                # architecture exists to escape, so they must be adapted.
+                "linear_attn.in_proj_be", "linear_attn.in_proj_bw",
+                "self_attn.q_proj", "self_attn.o_proj",
+                "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"]
+    if a.vera_all:
+        # every LoRA rule becomes rank 0; VeRA is installed on the same targets
+        # after the init adapters are folded in
+        rules = [(r[0], 0) + tuple(r[2:]) for r in rules]
+        print(f"  ALL-VeRA at rank {a.vera_all}: only the MLA latent stays dense",
+              flush=True)
+    if a.lora_tiled:
+        rules = list(rules) + [("linear_attn.in_proj_a", a.lora_tiled, 4.0)]
+        print(f"  in_proj_a adapted with LoRA r{a.lora_tiled} "
+              f"(37.75 M dense -> {a.lora_tiled*(1024+2048)*18/1e6:.2f} M)", flush=True)
     if a.kda_rank:
+        # chain from `rules`, NOT from LORA_RULES: starting over from the
+        # constant discards any earlier modification. --freeze-ffn worked alone
+        # and --kda-rank worked alone, and together the freeze was dropped, so
+        # the FFN trained 10.62 M of adapters in a run whose whole point was
+        # that it had none.
         rules = [((rule[0], a.kda_rank) + tuple(rule[2:]))
                  if rule[0].startswith("linear_attn.") else rule
-                 for rule in LORA_RULES]
+                 for rule in rules]
         print(f"  KDA projection LoRA rank -> {a.kda_rank}", flush=True)
 
     if a.init_adapters:
@@ -609,9 +917,39 @@ def main():
                   flush=True)
             merge_and_restart(student)
             resize_lora(student, rules)
+            # rank 0 means REMOVE the adapter. resize_lora cannot express that
+            # -- its guard is `if r and r != mod.rank`, and 0 is falsy, so a
+            # rank-0 rule silently leaves the adapter at whatever rank the
+            # checkpoint had. --freeze-ffn looked like it worked (the flag
+            # printed, the rank diff printed) and trained 5.31 M of FFN adapters
+            # anyway.
+            drop = [r[0] for r in rules if r[1] == 0]
+            if drop:
+                n_dropped = unwrap_lora(student, drop)
+                if n_dropped:
+                    print(f"  removed {n_dropped} adapters at rank 0 "
+                          f"({', '.join(drop)})", flush=True)
 
     if a.fuse_gate_lora:
         fuse_gate_lora(student)
+
+    if a.vera_all:
+        merge_and_restart(student)                 # fold the init delta in first
+        n_un = unwrap_lora(student, VERA_ALL)
+        inject_vera(student, [(p, 1) for p in VERA_ALL],
+                    rank=a.vera_all, d_init=a.vera_d_init)
+        print(f"  unwrapped {n_un} LoRA modules before installing VeRA", flush=True)
+
+    if a.vera_ffn:
+        # Fold whatever the init checkpoint put in the FFN adapters into the
+        # bases, drop the LoRA wrappers, then install VeRA on the bare Linears.
+        # Skipping the merge would silently discard the initialization.
+        merge_and_restart(student)
+        n_un = unwrap_lora(student, ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"])
+        inject_vera(student, [("mlp.gate_proj", 1), ("mlp.up_proj", 1),
+                              ("mlp.down_proj", 1)],
+                    rank=a.vera_rank, d_init=a.vera_d_init)
+        print(f"  swapped {n_un} FFN adapters from LoRA to VeRA", flush=True)
 
     mla_latents = []
     if a.mla_energy is not None or a.mla_dc is not None or a.mla_budget is not None:
@@ -648,7 +986,8 @@ def main():
     # after inject_lora, so lam scales (base + LoRA delta), not the frozen base
     if a.layerscale:
         install_layerscale(student)
-    also = ("lora_A", "lora_B", "a_lora_A", "a_lora_B", "A_log", "dt_bias")
+    also = ("lora_A", "lora_B", "a_lora_A", "a_lora_B", "A_log", "dt_bias",
+            "vera_d", "vera_b")
     if a.layerscale:
         also = also + ("ls_lambda",)
     if a.train_gate:
@@ -659,7 +998,13 @@ def main():
         # full rank for in_proj_b and would cost more params than the weight,
         # and a depthwise conv has no cross-channel mixing to factorize (its
         # full rank is the kernel size, 4). 0.73 M params for both.
-        also = also + ("in_proj_a.weight", "in_proj_b.weight", "conv1d.")
+        keep = ("in_proj_b.weight", "conv1d.")
+        # in_proj_a is either dense OR adapted, never both: leaving it in the
+        # dense set alongside its own adapter is the parallel-path problem that
+        # made the KDA gate unmeasurable (a dense matrix and a low-rank matrix
+        # competing on the same output, the low-rank one winning 7 to 1).
+        also = also + keep + (() if (a.lora_tiled or a.vera_all)
+                              else ("in_proj_a.weight",))
     if a.train_attn:
         also = also + ("linear_attn.", "self_attn.")
     if a.train_norms:
@@ -721,6 +1066,21 @@ def main():
         print(f"  norm gains cast to fp32: {n32:,} params "
               f"(bf16 would round a 2e-4 step to zero)", flush=True)
 
+    if a.per_head_q:
+        # After convert_to_mla replaced k_proj/v_proj, and BEFORE the parameter
+        # groups are collected. Installed after the collection, R never reaches
+        # the optimizer: it stays at identity for the whole run while the log
+        # cheerfully reports it as trainable.
+        from mercurius.surgery.perhead_q import install_per_head_q
+        install_per_head_q(student)
+        # n_tr was totalled before this point, so add the new parameters or the
+        # log under-reports by 3.15 M. The optimizer is correct either way --
+        # trainable_parameters walks the model below -- but a trainable count
+        # that silently disagrees with the model is how every earlier
+        # accounting bug here went unnoticed.
+        n_tr += sum(p.numel() for n, p in student.named_parameters()
+                    if n.endswith(".R") and p.requires_grad)
+
     params = trainable_parameters(student)
     print(f"  trainable: {n_tr/1e6:.2f} M params in {len(params)} tensors", flush=True)
 
@@ -728,7 +1088,34 @@ def main():
     # rate. That is 5-10x below normal LoRA practice, and it silently handicaps
     # every LoRA-heavy arm: a surface ablation run this way measures the
     # learning rate, not the surface.
-    if a.lora_lr:
+    if a.vera_lr:
+        _is_v = lambda n: "vera_d" in n or "vera_b" in n
+        _is_r = lambda n: n.endswith(".R")
+        vp = [p for n, p in student.named_parameters() if p.requires_grad and _is_v(n)]
+        # The per-head query map gets its OWN rate, for a reason that is neither
+        # "dense" nor "adapter":
+        #   at the dense rate 3e-5, AdamW's displacement ceiling over 150 steps
+        #   is 0.0045 per element. Measured on gdn2phq, R ended 0.42% off
+        #   identity with a max off-diagonal of 0.0017 -- the mechanism was
+        #   never exercised, so its +0.4 EM tested nothing.
+        #   at the VeRA rate 1e-2 the ceiling is 1.5 per element, LARGER than
+        #   the identity diagonal R is initialised to, so R can be erased.
+        # 1e-3 gives a ceiling of 0.15: enough for off-diagonals of order
+        # 0.01-0.1, which separates the heads without destroying the query.
+        rp = [p for n, p in student.named_parameters() if p.requires_grad and _is_r(n)]
+        dp = [p for n, p in student.named_parameters()
+              if p.requires_grad and not _is_v(n) and not _is_r(n)]
+        groups = [{"params": dp, "lr": a.lr}, {"params": vp, "lr": a.vera_lr}]
+        max_lr = [a.lr, a.vera_lr]
+        if rp:
+            groups.append({"params": rp, "lr": a.phq_lr})
+            max_lr.append(a.phq_lr)
+        print(f"  {2 + (1 if rp else 0)} groups: {sum(p.numel() for p in dp)/1e6:.2f} M dense "
+              f"@ {a.lr:g}, {sum(p.numel() for p in vp)/1e6:.3f} M VeRA "
+              f"@ {a.vera_lr:g}"
+              + (f", {sum(p.numel() for p in rp)/1e6:.2f} M per-head-q "
+                 f"@ {a.phq_lr:g}" if rp else ""), flush=True)
+    elif a.lora_lr:
         lora_keys = ("lora_A", "lora_B", "a_lora_A", "a_lora_B")
         lora_p, dense_p = [], []
         for nm, p in student.named_parameters():
@@ -814,16 +1201,17 @@ def main():
                 ck = (f"ckpt/"
                       f"adapters-{a.tag}-best.pt")
                 if improved:
-                    save_trainable(student, ck)
+                    save_trainable(student, ck, a.save_merged_bases)
                     print(f"    best so far: ppl@8192 {cur:.3f} -> {ck.split('/')[-1]}",
                           flush=True)
                 elif a.keep_step_ckpts:
-                    save_trainable(student, ck.replace("-best.pt", f"-step{step}.pt"))
+                    save_trainable(student, ck.replace("-best.pt", f"-step{step}.pt"),
+                                   a.save_merged_bases)
                 # Overwritten each eval, so it stays ~1.1 GiB rather than growing.
                 if step > 0 and _resume_ctx:
                     save_resume(f"ckpt/resume-{a.tag}.pt",
                                 student, _resume_ctx["opt"], _resume_ctx["sched"],
-                                step, _resume_ctx["gens"])
+                                step, _resume_ctx["gens"], a.save_merged_bases)
             else:
                 print("    (skipping checkpoint: under 8 GiB free)", flush=True)
         except Exception as e:
@@ -953,6 +1341,9 @@ def main():
            else batches(sample_ids, sl, a.steps - start_step, align=align,
                        gen=_bg, spans=doc_spans))
     for step, (batch, new_doc, batch_offset) in enumerate(gen, start=start_step + 1):
+        # TAID's target walks from the student's own distribution to the
+        # teacher's as training proceeds; ignored by the other modes
+        _taid_lam = min(1.0, step / max(a.steps, 1)) if a.taid else 1.0
         if a.state_passing and new_doc:
             reset_state(student)
         x = batch.cuda()
@@ -977,11 +1368,16 @@ def main():
                 h_t = get_trunk(teacher)(input_ids=x).last_hidden_state[0]
             h_s = get_trunk(student)(input_ids=x).last_hidden_state[0]
             W_lm = student.lm_head.weight
+            # position p predicts token p+1, so the last position has no target
+            # and is dropped -- 1 of 8192, and it keeps the CE mix well defined
+            nxt = x[0, 1:]
             tot, n = 0.0, 0
-            for i in range(0, L, a.fullkl_chunk):
-                j = min(i + a.fullkl_chunk, L)
-                terms = checkpoint(_chunk_fullkl_terms, h_s[i:j], h_t[i:j],
-                                   W_lm, use_reentrant=False)
+            for i in range(0, L - 1, a.fullkl_chunk):
+                j = min(i + a.fullkl_chunk, L - 1)
+                terms = checkpoint(_chunk_div_terms, h_s[i:j], h_t[i:j],
+                                   W_lm, a.divergence, _taid_lam,
+                                   nxt[i:j], a.ce_beta, a.ce_mix,
+                                   use_reentrant=False)
                 tot = tot + terms.sum()
                 n += j - i
             loss = tot / max(n, 1)
@@ -1041,12 +1437,33 @@ def main():
                     prm.data.lerp_(ref, lr_now * a.pull_to_init)
         if a.relora_every and step > 0 and step % a.relora_every == 0:
             nm = merge_and_restart(student, opt)
+            # VeRA needs its own merge, and crucially a NEW random A/B: its
+            # constraint is the fixed subspace, not the parameter count, so
+            # merging without re-drawing accumulates nothing.
+            nm += merge_vera(student, optimizer=opt, reseed=True,
+                             seed=1000 + step, d_init=a.vera_d_init,
+                             verbose=False)
             last_merge = step
             print(f'  [relora] merged and restarted {nm} adapters at step '
                   f'{step} (merge {step//a.relora_every})', flush=True)
         if a.state_passing:
             promote_state(student)   # after backward, so recompute stays valid
         hist["loss"].append(loss.item())
+        # Resume snapshots belong on their OWN cadence. Writing them only inside
+        # evaluate() tied recoverability to --eval-every, whose default is 150 --
+        # so a 150-step run wrote exactly one resume file, at the end, and an
+        # interruption at step 149 lost everything. An eval is two full 8192
+        # forwards; this is a 1.1 GiB overwrite of a file that already exists.
+        if (a.resume_every and step % a.resume_every == 0 and _resume_ctx
+                and step > 0):
+            try:
+                _stv = os.statvfs("/")
+                if _stv.f_bavail * _stv.f_frsize > 8 * 2**30:
+                    save_resume(f"ckpt/resume-{a.tag}.pt",
+                                student, _resume_ctx["opt"], _resume_ctx["sched"],
+                                step, _resume_ctx["gens"], a.save_merged_bases)
+            except Exception as _e:
+                print(f"  (resume save failed at step {step}: {_e})", flush=True)
         del t_logits, s_logits
         if step % 25 == 0:
             el = time.perf_counter() - t0
@@ -1063,7 +1480,7 @@ def main():
     # save the trained parameters -- without this a run's weights are lost and
     # only the eval curve survives.
     adp = f"ckpt/adapters-{a.tag}.pt"
-    n_saved = save_trainable(student, adp)
+    n_saved = save_trainable(student, adp, a.save_merged_bases)
     print(f"  saved {n_saved} trainable tensors", flush=True)
     print(f"\nwrote {out}\nwrote {adp}")
 

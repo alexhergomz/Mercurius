@@ -26,6 +26,8 @@ STAGE_AB = CKPT_DIR / "qwen3.5-0.8b-stageAB"
 
 WIKITEXT = DATA_DIR / "wikitext.txt"       # held-out eval
 FINEWEB = DATA_DIR / "fineweb_edu.txt"     # training / calibration corpus
+FINEWEB_LONG = DATA_DIR / "fineweb_edu_long.txt"   # documents >= one window
+SYNTH_RECALL = DATA_DIR / "synth_recall.txt"       # multi-fact retention corpus
 
 # Writes refuse below this much free space. The Jetson's root filesystem is the
 # only filesystem; filling it bricks the board.

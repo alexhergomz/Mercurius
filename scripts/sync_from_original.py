@@ -39,6 +39,19 @@ MODULES = {
     "eval_compressed_retrieval": "mercurius.eval.compressed_retrieval",
     "harness": "mercurius.harness",
     "guard": "mercurius.guard",
+    # architecture
+    "gdn2_model": "mercurius.models.gdn2",
+    "mtp_conv": "mercurius.models.mtp_conv",
+    "perhead_q": "mercurius.surgery.perhead_q",
+    # data
+    "synth_recall": "mercurius.recovery.synth_recall",
+    # evaluation
+    "eval_retrieval_ab": "mercurius.eval.retrieval_ab",
+    "ruler_gen": "mercurius.eval.ruler_gen",
+    "ruler_eval": "mercurius.eval.ruler",
+    "nolex_data": "mercurius.eval.nolex_data",
+    "nolex": "mercurius.eval.nolex",
+    "verify_checkpoint": "mercurius.eval.verify_checkpoint",
 }
 
 PATHS = [
@@ -52,6 +65,11 @@ PATHS = [
     (f'"{ORIGIN}/cache"', "str(CACHE_DIR)"),
     (f'"{ORIGIN}/logs"', "str(LOGS_DIR)"),
     (f'"{ORIGIN}/data"', "str(DATA_DIR)"),
+    (f'"{ORIGIN}/data/fineweb_edu_long.txt"', "str(DATA_DIR / 'fineweb_edu_long.txt')"),
+    (f'"{ORIGIN}/data/synth_recall.txt"', "str(DATA_DIR / 'synth_recall.txt')"),
+    (f'"{ORIGIN}/data/ruler/PaulGrahamEssays.json"',
+     "str(DATA_DIR / 'ruler' / 'PaulGrahamEssays.json')"),
+    (f'"{ORIGIN}/data/nolima"', "str(DATA_DIR / 'nolima')"),
     (f"{ORIGIN}/", ""),
 ]
 NAMES = ["STAGE_AB", "BASE_MODEL", "WIKITEXT", "FINEWEB",

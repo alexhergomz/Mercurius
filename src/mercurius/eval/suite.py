@@ -21,34 +21,52 @@ def ce_and_topk(model, ids, n, ks=(1, 5, 10), chunk=1024, teacher=None):
     """Cross-entropy, top-k accuracy vs ground truth, and top-1/k agreement
     with a teacher if supplied. Chunked: vocab is 248,320."""
     x = ids[:n].unsqueeze(0).cuda()
-    out = model(input_ids=x)
-    logits, tgt = out.logits[0], x[0, 1:]
+    # Ask for hidden states and suppress the full logit tensor. The lm_head is
+    # applied chunk-wise below instead, because at 8192 x 248,320 the full
+    # logits are 4.1 GiB resident for the whole eval -- and two concurrent evals
+    # in that state hard-reset this machine on 2026-09-20. Chunked, the peak is
+    # one chunk's worth and it is freed each iteration.
+    out = model(input_ids=x, output_hidden_states=True, logits_to_keep=1)
+    h = out.hidden_states[-1][0]
+    W_lm = model.get_output_embeddings().weight
+    # hidden_states[-1] must be POST final-norm, or every logit is wrong. Checked
+    # against the model's own last-position logits rather than assumed.
+    _ref = out.logits[0, -1].float()
+    _got = (h[-1:] @ W_lm.T).float()[0]
+    if (_ref - _got).abs().max() > 1e-2 * _ref.abs().max().clamp_min(1e-6):
+        raise RuntimeError(
+            "hidden_states[-1] is not the tensor lm_head consumes; chunked "
+            "logits would be wrong. Fall back to out.logits.")
+    tgt = x[0, 1:]
 
-    t_logits = None
+    t_h = None
     if teacher is not None:
-        t_logits = teacher(input_ids=x).logits[0]
+        t_out = teacher(input_ids=x, output_hidden_states=True,
+                        logits_to_keep=1)
+        t_h = t_out.hidden_states[-1][0]
+        t_W = teacher.get_output_embeddings().weight
 
     tot_ce, cnt = 0.0, 0
     hits = {k: 0 for k in ks}
     agree = {k: 0 for k in ks}
     for i in range(0, n - 1, chunk):
         j = min(i + chunk, n - 1)
-        sl = logits[i:j].float()
+        sl = (h[i:j] @ W_lm.T).float()
         tg = tgt[i:j]
         tot_ce += F.cross_entropy(sl, tg, reduction="sum").item()
         cnt += j - i
         top = sl.topk(max(ks), dim=-1).indices
         for k in ks:
             hits[k] += (top[:, :k] == tg.unsqueeze(-1)).any(-1).sum().item()
-        if t_logits is not None:
-            tt = t_logits[i:j].float().topk(max(ks), dim=-1).indices
+        if t_h is not None:
+            tt = (t_h[i:j] @ t_W.T).float().topk(max(ks), dim=-1).indices
             for k in ks:
                 # does the teacher's argmax appear in the student's top-k?
                 agree[k] += (top[:, :k] == tt[:, :1]).any(-1).sum().item()
         del sl
-    del out, logits
-    if t_logits is not None:
-        del t_logits
+    del out, h
+    if t_h is not None:
+        del t_h, t_out
     torch.cuda.empty_cache()
 
     ce = tot_ce / cnt
