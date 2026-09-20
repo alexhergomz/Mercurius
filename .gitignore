@@ -1,12 +1,16 @@
 # Model weights and training artifacts — never committed. The base model is
 # ~1.7 GB, a single resume file is ~1.2 GB, and the board's root filesystem is
 # the only filesystem.
-ckpt/
-models/
-cache/
-logs/
-data/
-probe/
+# Leading slash anchors these to the repo root. Unanchored, "models/" also
+# matched src/mercurius/models/, so the entire models subpackage -- kda.py
+# included, the core layer of the project -- was excluded from every commit and
+# the published package was not importable.
+/ckpt/
+/models/
+/cache/
+/logs/
+/data/
+/probe/
 *.pt
 *.safetensors
 *.bin
