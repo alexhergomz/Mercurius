@@ -76,11 +76,10 @@ def _fast_conv_for_stock(m):
     the baseline is not slowed by a missing package. Outputs agree to bf16
     rounding (relL2 3.1e-3 on the conv alone).
     """
-    from fla.modules.convolution import causal_conv1d
+    from mercurius.models.kda import fla_causal_conv
     def conv(x, weight, bias=None, activation=None, seq_idx=None):
-        y = causal_conv1d(x=x.transpose(1, 2), weight=weight, bias=bias,
-                          activation=activation)[0]
-        return y.transpose(1, 2)
+        return fla_causal_conv(x.transpose(1, 2), weight, bias,
+                               activation=activation).transpose(1, 2)
     n = 0
     for mod in m.modules():
         if type(mod).__name__ == "Qwen3_5GatedDeltaNet" and mod.causal_conv1d_fn is None:

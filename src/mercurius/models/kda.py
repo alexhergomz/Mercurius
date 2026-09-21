@@ -35,6 +35,29 @@ try:
     from fla.modules.convolution import causal_conv1d as _fla_conv
 except ImportError:
     _fla_conv = None
+
+
+def fla_causal_conv(x, weight, bias=None, activation="silu"):
+    """fla's Triton causal depthwise conv on x (B, T, C), safe at any length.
+
+    The kernel indexes with 32-bit offsets: at T x C >= 2^31 it reads out of
+    bounds (measured: 262,143 x 8192 runs, 262,145 x 8192 is an illegal memory
+    access). Longer inputs are split along T, each chunk prefixed with the
+    previous K-1 frames and those outputs dropped, which is exactly the
+    unsplit convolution.
+    """
+    B, T, C = x.shape
+    K = weight.shape[-1]
+    lim = (2 ** 31 - 1) // (B * C) - K
+    if T <= lim:
+        return _fla_conv(x=x, weight=weight, bias=bias, activation=activation)[0]
+    step, outs = lim - (K - 1), []
+    for s in range(0, T, step):
+        lo = max(0, s - (K - 1))
+        y = _fla_conv(x=x[:, lo:s + step].contiguous(), weight=weight, bias=bias,
+                      activation=activation)[0]
+        outs.append(y[:, s - lo:])
+    return torch.cat(outs, dim=1)
 import transformers.models.qwen3_5.modeling_qwen3_5 as qm
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
 
@@ -328,9 +351,9 @@ class Qwen3_5KDAGatedDeltaNet(Qwen3_5GatedDeltaNet):
                 x=mixed_qkv, weight=self.conv1d.weight.squeeze(1),
                 bias=self.conv1d.bias, activation=self.activation, seq_idx=None)
         if _fla_conv is not None and self.activation in ("silu", "swish"):
-            y = _fla_conv(x=mixed_qkv.transpose(1, 2),
-                          weight=self.conv1d.weight.squeeze(1),
-                          bias=self.conv1d.bias, activation="silu")[0]
+            y = fla_causal_conv(mixed_qkv.transpose(1, 2),
+                                self.conv1d.weight.squeeze(1),
+                                self.conv1d.bias, activation="silu")
             return y.transpose(1, 2)
         return F.silu(self.conv1d(mixed_qkv)[:, :, :T])
 
