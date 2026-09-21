@@ -19,10 +19,16 @@ MODELS_DIR = Path(os.environ.get("MERCURIUS_MODELS", ROOT / "models"))
 CACHE_DIR = Path(os.environ.get("MERCURIUS_CACHE", ROOT / "cache"))
 LOGS_DIR = Path(os.environ.get("MERCURIUS_LOGS", ROOT / "logs"))
 
-# the unmodified teacher, as downloaded
-BASE_MODEL = MODELS_DIR / "qwen3.5-0.8b"
+# The model being converted (the student), as downloaded. Stages A-D run on it.
+STUDENT_NAME = os.environ.get("MERCURIUS_STUDENT", "qwen3.5-4b")
+BASE_MODEL = MODELS_DIR / STUDENT_NAME
+# The distillation teacher. Must share the student's tokenizer and vocabulary,
+# which holds across the Qwen3.5 family (248,320). Set it to the student's own
+# name to recover the original self-distillation setup.
+TEACHER_NAME = os.environ.get("MERCURIUS_TEACHER", "qwen3.5-27b")
+TEACHER_MODEL = MODELS_DIR / TEACHER_NAME
 # output of surgery stages A+B: norms fused, GatedDeltaNet lifted to KDA
-STAGE_AB = CKPT_DIR / "qwen3.5-0.8b-stageAB"
+STAGE_AB = CKPT_DIR / f"{STUDENT_NAME}-stageAB"
 
 WIKITEXT = DATA_DIR / "wikitext.txt"       # held-out eval
 FINEWEB = DATA_DIR / "fineweb_edu.txt"     # training / calibration corpus

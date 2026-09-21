@@ -17,7 +17,8 @@ import torch.nn.functional as F
 
 
 @torch.no_grad()
-def ce_and_topk(model, ids, n, ks=(1, 5, 10), chunk=1024, teacher=None):
+def ce_and_topk(model, ids, n, ks=(1, 5, 10), chunk=1024, teacher=None,
+                before_forward=None):
     """Cross-entropy, top-k accuracy vs ground truth, and top-1/k agreement
     with a teacher if supplied. Chunked: vocab is 248,320."""
     x = ids[:n].unsqueeze(0).cuda()
@@ -26,24 +27,24 @@ def ce_and_topk(model, ids, n, ks=(1, 5, 10), chunk=1024, teacher=None):
     # logits are 4.1 GiB resident for the whole eval -- and two concurrent evals
     # in that state hard-reset this machine on 2026-09-20. Chunked, the peak is
     # one chunk's worth and it is freed each iteration.
-    out = model(input_ids=x, output_hidden_states=True, logits_to_keep=1)
-    h = out.hidden_states[-1][0]
+    # Final hidden states straight from the trunk (post final-norm, the tensor
+    # lm_head consumes -- the trainer reads the same thing), with the lm_head
+    # applied chunk-wise below. The previous version asked for
+    # output_hidden_states=True, which keeps EVERY layer's states: 65 x 8192 x
+    # 5120 for a 27B teacher, ~5 GiB, at the moment unified memory was already
+    # tightest. That eval is where the 2026-09-21 machine reset happened.
+    from mercurius.surgery.norm_fusion import get_trunk
+    if before_forward is not None:      # e.g. a thermal cool-down
+        before_forward()
+    h = get_trunk(model)(input_ids=x).last_hidden_state[0]
     W_lm = model.get_output_embeddings().weight
-    # hidden_states[-1] must be POST final-norm, or every logit is wrong. Checked
-    # against the model's own last-position logits rather than assumed.
-    _ref = out.logits[0, -1].float()
-    _got = (h[-1:] @ W_lm.T).float()[0]
-    if (_ref - _got).abs().max() > 1e-2 * _ref.abs().max().clamp_min(1e-6):
-        raise RuntimeError(
-            "hidden_states[-1] is not the tensor lm_head consumes; chunked "
-            "logits would be wrong. Fall back to out.logits.")
     tgt = x[0, 1:]
 
     t_h = None
     if teacher is not None:
-        t_out = teacher(input_ids=x, output_hidden_states=True,
-                        logits_to_keep=1)
-        t_h = t_out.hidden_states[-1][0]
+        if before_forward is not None:
+            before_forward()
+        t_h = get_trunk(teacher)(input_ids=x).last_hidden_state[0]
         t_W = teacher.get_output_embeddings().weight
 
     tot_ce, cnt = 0.0, 0
@@ -64,9 +65,9 @@ def ce_and_topk(model, ids, n, ks=(1, 5, 10), chunk=1024, teacher=None):
                 # does the teacher's argmax appear in the student's top-k?
                 agree[k] += (top[:, :k] == tt[:, :1]).any(-1).sum().item()
         del sl
-    del out, h
+    del h
     if t_h is not None:
-        del t_h, t_out
+        del t_h
     torch.cuda.empty_cache()
 
     ce = tot_ce / cnt

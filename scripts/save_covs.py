@@ -25,6 +25,13 @@ def main():
                     help="CARE reports saturation past ~512; 256 is their default")
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--out", default=str(CACHE_DIR / 'kv_covs.pt'))
+    ap.add_argument("--adapters", default=None,
+                    help="trained adapters to calibrate under; default is the "
+                         "untrained converted model, which is what a one-shot "
+                         "run (every stage, then recovery) converts from")
+    ap.add_argument("--gdn2", action="store_true")
+    ap.add_argument("--seed-alpha", type=float, default=0.0,
+                    help="match the trainer's --seed-alpha; <=0 means none")
     a = ap.parse_args()
 
     # This machine's root fs is the only fs. Filling it bricks the Jetson, so
@@ -39,7 +46,8 @@ def main():
     calib = tok(open(CALIB).read(), return_tensors="pt").input_ids[0]
     print(f"calibration corpus {len(calib):,} tokens (fineweb-edu)", flush=True)
 
-    m = build()
+    m = build(a.adapters, gdn2=a.gdn2,
+              seed_alpha=a.seed_alpha if a.seed_alpha > 0 else None)
     print(f"collecting covariances: {a.samples} x {a.seq} tokens", flush=True)
     covs = collect_covariances(m, calib, a.samples, a.seq)
     del m

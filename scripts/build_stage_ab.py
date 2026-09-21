@@ -37,8 +37,13 @@ def main():
     batch = {k: v.cuda() for k, v in batch.items()}
 
     print("reference ...", flush=True)
+    # .float() is NOT redundant. transformers 5.6 loads this composite (VL)
+    # checkpoint in its stored bf16 despite dtype=float32, so without the cast
+    # stage A folds the norm gains in bf16 -- measured relL2 1.1e-2 for A alone
+    # on the 4B, 30x the bound, where the fp32 fold gives 1.0e-4.
     m = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32,
-                                             device_map="cuda").eval()
+                                             device_map="cuda").float().eval()
+    assert m.dtype == torch.float32, m.dtype
     ref = logits_for(m, batch)
 
     print("stage A: fusing norms ...", flush=True)

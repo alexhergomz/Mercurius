@@ -307,47 +307,55 @@ class Qwen3_5KDAGatedDeltaNet(Qwen3_5GatedDeltaNet):
         a = a.unflatten(-1, (self.kda_heads, self.kda_dim))
         return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
 
-    @qm.force_accelerate_hooks("conv1d")
+    def _conv(self, mixed_qkv):
+        """Causal depthwise conv + activation over (B, C, T), no cache."""
+        T = mixed_qkv.shape[-1]
+        if self.causal_conv1d_fn is not None:
+            return self.causal_conv1d_fn(
+                x=mixed_qkv, weight=self.conv1d.weight.squeeze(1),
+                bias=self.conv1d.bias, activation=self.activation, seq_idx=None)
+        return F.silu(self.conv1d(mixed_qkv)[:, :, :T])
+
+    # Mirrors the stock Qwen3_5GatedDeltaNet.forward of the installed
+    # transformers (5.6) line for line, except for: the channel-wise decay, the
+    # kernel call (isolated in _run_kernel), and segment state passing. The
+    # previous version targeted an API (force_accelerate_hooks, cache
+    # state_idx/record_past, module-level causal_conv1d_fn) that 5.6 does not
+    # have, so it could not even be imported here.
     def forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
         hidden_states = qm.apply_mask_to_padding_states(hidden_states, attention_mask)
         batch_size, seq_len, _ = hidden_states.shape
         use_precomputed_states = (
             cache_params is not None
-            and cache_params.has_previous_state(self.layer_idx, state_idx=0))
+            and cache_params.has_previous_state(self.layer_idx) and seq_len == 1)
 
         mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        # Carry the conv receptive field across segments. Without this the
-        # causal Conv1d (kernel 4) sees zero padding at every segment boundary
-        # instead of the previous tokens, corrupting the first few q/k/v
-        # positions -- which then feed the recurrent state and compound.
-        conv_pad = 0
-        if self._state_passing:
-            if self._conv_carry is not None:
-                mixed_qkv = torch.cat([self._conv_carry, mixed_qkv], dim=-1)
-                conv_pad = self._conv_carry.shape[-1]
-            self._conv_pending = mixed_qkv[..., -(self.conv_kernel_size - 1):].detach()
         z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
         g = self._decay(hidden_states)                      # (B, T, H, Dk)
 
-        if use_precomputed_states and seq_len == 1 and not cache_params.layers[self.layer_idx].record_past:
-            conv_state = cache_params.layers[self.layer_idx].conv_states[0]
-            mixed_qkv = qm.causal_conv1d_update(
+        if use_precomputed_states:
+            conv_state = cache_params.layers[self.layer_idx].conv_states
+            mixed_qkv = self.causal_conv1d_update(
                 mixed_qkv, conv_state, self.conv1d.weight.squeeze(1),
                 self.conv1d.bias, self.activation)
         else:
             if cache_params is not None:
-                mixed_qkv = cache_params.update_conv_state(
-                    mixed_qkv, self.layer_idx, conv_kernel_size=self.conv_kernel_size)
-            mixed_qkv = qm.causal_conv1d_fn(
-                mixed_qkv, self.conv1d.weight.squeeze(1), self.conv1d.bias,
-                activation=self.activation, **kwargs)
-            if cache_params is not None:
-                mixed_qkv = mixed_qkv[:, :, -seq_len:]
-        if conv_pad and mixed_qkv.shape[-1] == seq_len + conv_pad:
-            # the reference conv returns input_len outputs, so the prepended
-            # frames are still present and must be dropped. Some kernels consume
-            # them instead and already return seq_len -- hence the guard.
-            mixed_qkv = mixed_qkv[:, :, conv_pad:]
+                conv_state = F.pad(mixed_qkv,
+                                   (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+                cache_params.update_conv_state(conv_state, self.layer_idx)
+            # Carry the conv receptive field across segments. Without this the
+            # causal Conv1d (kernel 4) sees zero padding at every segment
+            # boundary instead of the previous tokens, corrupting the first few
+            # q/k/v positions -- which then feed the recurrent state and compound.
+            conv_pad = 0
+            if self._state_passing:
+                if self._conv_carry is not None:
+                    mixed_qkv = torch.cat([self._conv_carry, mixed_qkv], dim=-1)
+                    conv_pad = self._conv_carry.shape[-1]
+                self._conv_pending = mixed_qkv[..., -(self.conv_kernel_size - 1):].detach()
+            mixed_qkv = self._conv(mixed_qkv)
+            if conv_pad:
+                mixed_qkv = mixed_qkv[:, :, conv_pad:]
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(
@@ -361,7 +369,7 @@ class Qwen3_5KDAGatedDeltaNet(Qwen3_5GatedDeltaNet):
             query = query.repeat_interleave(rep, dim=2)
             key = key.repeat_interleave(rep, dim=2)
 
-        recurrent_state = (cache_params.layers[self.layer_idx].recurrent_states[0]
+        recurrent_state = (cache_params.layers[self.layer_idx].recurrent_states
                            if use_precomputed_states else None)
         if self._state_passing and self._carry is not None:
             recurrent_state = self._carry
@@ -369,16 +377,12 @@ class Qwen3_5KDAGatedDeltaNet(Qwen3_5GatedDeltaNet):
         query, key = self._decay_phase(query, key, g)
         core_attn_out, last_recurrent_state = self._run_kernel(
             query, key, value, g, hidden_states,
-            recurrent_state, want_final,
-            use_precomputed_states and seq_len == 1,
-            kwargs.pop("cu_seq_lens_q", None),
-        )
+            recurrent_state, want_final, use_precomputed_states, None)
 
         if self._state_passing and last_recurrent_state is not None:
             # Write to _pending, NOT _carry. Gradient checkpointing recomputes
             # the forward during backward; if the carried state changed in
             # between, the recompute diverges and torch raises CheckpointError.
-            # Keeping forward read-only w.r.t. _carry makes it deterministic.
             # promote_state() moves _pending -> _carry after the step.
             self._pending = last_recurrent_state.detach()
         if cache_params is not None:
@@ -437,7 +441,7 @@ def load_kda_model(path, dtype=torch.float32, device="cuda"):
     convert, then load.
     """
     import os
-    from safetensors.torch import load_file
+    from safetensors import safe_open
     from transformers import AutoConfig, AutoModelForCausalLM
 
     cfg = AutoConfig.from_pretrained(path)
@@ -446,42 +450,51 @@ def load_kda_model(path, dtype=torch.float32, device="cuda"):
         raise ValueError(f"{path} is not a KDA-converted checkpoint "
                          "(config lacks kda_lift)")
 
-    # Build with real initialization, NOT on meta + to_empty(). to_empty()
-    # replaces every tensor with uninitialized memory including NON-PERSISTENT
-    # buffers -- notably rotary_emb.inv_freq, which by design is absent from the
-    # checkpoint and therefore never restored. That silently breaks RoPE in the
-    # full-attention layers (measured: relL2 1.18e-1, wrong but not random).
-    model = AutoModelForCausalLM.from_config(cfg)
-    convert_to_kda(model, cfg, lora_rank=getattr(tcfg, "kda_lora_rank", 0),
-                   copy_from_gdn=False, verbose=False)
+    # Built directly ON THE DEVICE in the target dtype, with real
+    # initialization (NOT meta + to_empty(): that leaves non-persistent buffers
+    # like rotary_emb.inv_freq uninitialised -- measured relL2 1.18e-1).
+    #
+    # Then streamed in one tensor at a time. The previous version read every
+    # shard into CPU memory (16.6 GiB of fp32 for the 4B), built a second full
+    # fp32 copy on the CPU and only then moved it: a >33 GiB peak on a board
+    # whose CPU and GPU share one 121 GiB pool with other services. The kernel
+    # logged NVRM out-of-memory at exactly that point of a run on 2026-09-21.
+    # Peak is now the model in its final dtype plus one tensor.
+    with torch.device(device):
+        model = AutoModelForCausalLM.from_config(cfg, dtype=dtype)
+        convert_to_kda(model, cfg, lora_rank=getattr(tcfg, "kda_lora_rank", 0),
+                       copy_from_gdn=False, verbose=False)
+    model.to(dtype)
 
-    shards = [f for f in os.listdir(path) if f.endswith(".safetensors")]
-    raw = {}
-    for sh in shards:
-        raw.update(load_file(os.path.join(path, sh)))
-
-    # The checkpoint carries the VLM wrapper's tree (model.language_model.*),
-    # while from_config on the saved TEXT config builds a text-only model
-    # (model.*). Normalize. The vision tower is dropped: this project performs
-    # LM-only surgery with the ViT frozen, so it is reattached from the original
-    # checkpoint rather than carried through every conversion.
-    sd, dropped = {}, 0
-    for k, v in raw.items():
-        if ".visual." in k or k.startswith("visual."):
-            dropped += 1
-            continue
-        sd[k.replace("model.language_model.", "model.")] = v
+    # The checkpoint may carry the VLM wrapper's tree (model.language_model.*)
+    # while from_config on the saved TEXT config builds model.*; normalise. The
+    # vision tower is dropped: LM-only surgery, reattached from the original.
+    own = model.state_dict()
+    loaded, dropped, unexpected = set(), 0, []
+    shards = sorted(f for f in os.listdir(path) if f.endswith(".safetensors"))
+    with torch.no_grad():
+        for sh in shards:
+            with safe_open(os.path.join(path, sh), framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    if ".visual." in k or k.startswith("visual."):
+                        dropped += 1
+                        continue
+                    name = k.replace("model.language_model.", "model.")
+                    if name not in own:
+                        unexpected.append(name)
+                        continue
+                    own[name].copy_(f.get_tensor(k))
+                    loaded.add(name)
     if dropped:
         print(f"  (dropped {dropped} vision-tower tensors; LM-only checkpoint)")
-
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    # tied lm_head is expected to be absent from the shard
-    missing = [k for k in missing if "lm_head" not in k]
+    # tied lm_head is expected to be absent from the shard; non-persistent
+    # buffers never appear in state_dict at all
+    missing = [k for k in own if k not in loaded and "lm_head" not in k]
     if missing or unexpected:
         raise RuntimeError(f"state dict mismatch: missing={missing[:5]} "
                            f"unexpected={unexpected[:5]}")
     model.tie_weights()
-    return model.to(device=device, dtype=dtype).eval()
+    return model.eval()
 
 
 # ------------------------------------------------------- state passing helpers

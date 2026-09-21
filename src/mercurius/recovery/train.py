@@ -36,10 +36,12 @@ import bitsandbytes as bnb
 from mercurius.recovery.logit_cache import build_cache, load_cache, topk_kl, taid_kl
 from mercurius.surgery.transmla import convert_to_mla
 from mercurius.adapters.layerscale import install_layerscale
-from mercurius.paths import BASE_MODEL, FINEWEB, STAGE_AB, WIKITEXT
+from mercurius.paths import (BASE_MODEL, CKPT_DIR, FINEWEB, LOGS_DIR, STAGE_AB,
+                             TEACHER_MODEL, WIKITEXT)
 
 CKPT = str(STAGE_AB)
 ORIG = str(BASE_MODEL)
+TEACHER = str(TEACHER_MODEL)
 TRAIN_DATA = str(FINEWEB)   # train
 EVAL_DATA  = str(WIKITEXT)      # eval, held out
 
@@ -147,96 +149,116 @@ def _chunk_kl_terms(h_c, W_lm, tv_c, ti_c, lam, use_taid):
             else topk_kl_terms(s_sel, tv_c))
 
 
-def _chunk_div_terms(h_s_c, h_t_c, W_lm, mode="forward", lam=1.0,
-                     tgt_c=None, ce_beta=1.0, ce_mix=0.0):
-    """Per-position divergence between student and teacher, full vocabulary.
+def taid_space_for(mode):
+    """The TAID interpolation space that is NOT degenerate for a divergence.
 
-    Both distributions are available explicitly here, so every one of these is
-    a direct expression -- no sampling, no estimator, same cost as forward KL.
-    That is unusual: reverse KL normally needs samples from the student (MiniLLM
-    uses policy gradients for exactly this), and it is only cheap because the
-    live teacher already gives us the full logits.
+    Derivation (student logits z_s, teacher log-probs log p_T, target m built
+    from a DETACHED copy of the student, gradients w.r.t. z_s):
 
-      forward  KL(t || s)   mode-covering. The student must put mass wherever
-                            the teacher does, so a student that CANNOT represent
-                            the teacher spreads itself thin to cover it.
-      reverse  KL(s || t)   mode-seeking. The student concentrates on a subset
-                            of the teacher's modes and ignores the rest --
-                            arguably the right objective when the student is
-                            structurally incapable of matching, which is exactly
-                            our case: linear attention, 4x compressed KV, NoPE.
-      js                    symmetric, bounded, no mode preference.
-      taid                  target interpolated from the student's OWN current
-                            distribution toward the teacher as lam goes 0 -> 1,
-                            so the target is always reachable from where the
-                            student is.
+      logit space  m = softmax((1-t) z_s + t z_T)      (TAID, arXiv:2501.16937)
+        forward  KL(m||s):  grad = s - m               genuine; ~ t*grad KL(s||T)
+                                                       at small t, grad KL(T||s)
+                                                       at t=1 (reverse -> forward)
+        reverse  KL(s||m):  log s - log m = t (log s - log p_T) + const, so
+                            grad = t * grad KL(s||T)   EXACTLY: a loss scale
 
-    THE GROUND-TRUTH TERM IS MIXED INTO THE TARGET, not added as a second
-    loss. CE is exactly forward KL against a one-hot: KL(delta_y || p_s) =
-    -log p_s(y). So it is already the same object in the same units -- but only
-    for forward. KL(p_s || delta_y) is infinite, so reverse cannot take a
-    one-hot target at all, and a separately weighted CE would silently mean
-    something different in each mode.
+      prob space   m = (1-t) s + t p_T
+        forward  KL(m||s):  grad = s - m = t (s - p_T) = t * grad KL(T||s)
+                                                       EXACTLY: a loss scale
+        reverse  KL(s||m):  genuine. This is DistiLLM's skew reverse KL
+                            (Ko et al., ICML 2024) with alpha = 1 - t; at small
+                            t its gradient is ~ t * grad KL(T||s), so the
+                            curriculum runs forward -> reverse.
 
-    Mixing the target instead,
-
-        q = (1 - w) * p_teacher + w * delta_y
-
-    fixes all of it: q inherits the teacher's full support so reverse is finite,
-    the magnitude is automatically the teacher term's because it IS the teacher
-    term with a perturbed target, and w = 0 recovers the current objective
-    exactly. w is then an interpretable interpolation between "match the
-    teacher" and "match the data" rather than a coefficient needing a scale
-    hunt.
-
-    This is also the only mechanism here that can exceed the teacher. Pure
-    distillation caps the student at teacher quality by construction; the data
-    term is what lets it win where the teacher and the corpus disagree.
-
-    NOT Wasserstein. It needs a ground metric over the vocabulary, and there
-    isn't a principled one for tokens -- embedding distance is a choice, not a
-    fact. Even granting one, the cost matrix is 248,320^2. Sinkhorn on a
-    truncated support is conceivable but it is a research project, not a flag.
+    So in each space one of the two divergences turns TAID into nothing but a
+    ramp on the loss scale, i.e. a second LR warmup. The previous code used
+    prob space for every mode, which made forward+TAID exactly that; the
+    paper's logit space makes reverse+TAID exactly that. Checked numerically in
+    experiments/test_objective.py.
     """
-    lg_t = (h_t_c @ W_lm.T).float()
+    return {"forward": "logit", "reverse": "prob"}.get(mode)
+
+
+def _chunk_div_terms(h_s_c, h_t_c, W_s, W_t, mode="forward", lam=1.0,
+                     tgt_c=None, ce_beta=1.0, ce_mix=0.0, taid_space="prob"):
+    """Per-position (divergence, data) terms, full vocabulary, in nats.
+
+    Returns a (2, C) tensor: row 0 the distillation divergence, row 1 the data
+    term (zeros when ce_beta == 0). The loss is row0 + ce_beta * row1. They are
+    returned separately because TAID's adaptive schedule reads the distillation
+    term alone.
+
+    W_s and W_t are the two models' OWN output heads. They used to be one
+    matrix, because the teacher was the student's unmodified original and the
+    two shared a tied embedding. A different-size teacher has a different
+    hidden width and its own head, and projecting its hidden states through the
+    student's head is not merely wrong, it does not type-check.
+
+    Both distributions are available explicitly here, so every mode is a direct
+    expression -- no sampling, no estimator, same cost as forward KL. Reverse KL
+    normally needs samples from the student (MiniLLM uses policy gradients for
+    exactly this); it is cheap only because the live teacher gives full logits.
+
+      forward  KL(t || s)   mode-covering
+      reverse  KL(s || t)   mode-seeking: the principled choice when the student
+                            is structurally incapable of matching the teacher,
+                            which here is both architectural (linear attention,
+                            compressed KV, NoPE) and a 4B-vs-27B capacity gap
+      js                    symmetric, bounded
+      TAID                  target built from the student's own (detached)
+                            distribution and the teacher's, moving to the
+                            teacher as lam -> 1. See taid_space_for for which
+                            interpolation space is meaningful under which mode.
+
+    THE DATA TERM, in excess nats:
+
+        CE(y, student) - CE(y, teacher) = -log p_s(y) + log p_t(y)
+
+    Zero when the student equals the teacher, negative when it beats it on the
+    true token, and on the distillation term's scale by construction, so
+    beta = 1 is meaningful. The offset log p_t(y) carries no gradient; it only
+    makes the logged loss read as excess.
+
+    This is CE in every mode, NOT D(y || s) - D(y || t) in the chosen
+    divergence, which is what it used to be. CE is exactly forward KL against a
+    one-hot, so in forward mode the two agree (up to the eps smoothing the old
+    form needed). In reverse mode D(y || s) = KL(s || y_eps) =
+    -H(s) + (1 - s_y) log(V/eps) + ..., minimised only by a point mass with a
+    per-nat weight of log(V/eps) ~ 21.6 -- measured on the 0.8B as ppl@8192
+    20.377 -> 104.972 in 100 steps. The excess-nats idea was right; carrying it
+    through the reverse divergence was the error, because "cross-entropy in
+    reverse" is not a cross-entropy.
+
+    ce_mix (q = (1-w) p_teacher + w delta_y) is kept as an alternative that
+    changes the target instead of adding a term.
+    """
+    lg_t = (h_t_c @ W_t.T).float()
     t_lp = F.log_softmax(lg_t, -1)
     del lg_t
-    lg_s = (h_s_c @ W_lm.T).float()
+    lg_s = (h_s_c @ W_s.T).float()
     s_lp = F.log_softmax(lg_s, -1)
     del lg_s
-    # TAID: walk the target from the student's own distribution to the
-    # teacher's. lam = 1 leaves t_lp untouched, so every mode is bit-identical
-    # to pure distillation when TAID is off.
-    # Data mixed INTO THE TARGET. This is not a scale fix, it is a shape fix.
-    #
-    # The additive form below (ce_beta) adds D(y||s) - D(y||t) for a near-one-hot
-    # y. In FORWARD mode that is ordinary cross-entropy, -log p_s(y): it raises
-    # the mass on the true token and leaves the rest of the distribution free.
-    # In REVERSE mode the same term is KL(s||y), which is minimised ONLY when
-    # p_s = y -- that is, when the student becomes a POINT MASS. It is an
-    # entropy-collapse objective wearing a cross-entropy costume.
-    #
-    # Demonstrated by direct minimisation over a free distribution:
-    #     reverse vs smoothed one-hot -> student entropy 0.0000 nats, p(y)=1.0000
-    #     reverse vs mixed target q   -> student entropy 9.6918 nats, p(y)=0.1000
-    # (teacher entropy 10.409 nats). Measured on the real model, reverse+ce_beta=1
-    # ran ppl@8192 20.377 -> 23.939 -> 104.972 in 100 steps while top-1 held at
-    # 41.9%: exactly a collapsed, over-confident distribution.
-    #
-    # q = (1-W) p_teacher + W delta_y keeps the teacher's support AND its entropy,
-    # so there is nothing to collapse toward and the term is portable across
-    # divergences. W = 0 recovers pure distillation bit-exactly.
+    data = torch.zeros(s_lp.shape[0], device=s_lp.device, dtype=s_lp.dtype)
+    if ce_beta != 0.0 and tgt_c is not None:
+        idx = tgt_c.view(-1, 1).long()
+        # excess over the UNMODIFIED teacher, before any mix or TAID
+        data = t_lp.gather(-1, idx).squeeze(-1) - s_lp.gather(-1, idx).squeeze(-1)
     if ce_mix > 0.0 and tgt_c is not None:
         V = t_lp.shape[-1]
         y = torch.full_like(t_lp, CE_EPS / V)
         y.scatter_(-1, tgt_c.view(-1, 1).long(), 1.0 - CE_EPS + CE_EPS / V)
         q = (1.0 - ce_mix) * t_lp.exp() + ce_mix * y
         t_lp = (q / q.sum(-1, keepdim=True).clamp_min(1e-9)).clamp_min(1e-9).log()
-    # TAID walks from the student's own distribution toward THAT target, so the
-    # mix is applied first: the target is the thing being approached.
+    # TAID walks from the student's own distribution toward the target (after
+    # the mix, since the target is the thing being approached). lam = 1 leaves
+    # t_lp untouched, so every mode is bit-identical to plain distillation.
     if lam < 1.0:
-        q0 = (1.0 - lam) * s_lp.exp().detach() + lam * t_lp.exp()
-        t_lp = (q0 / q0.sum(-1, keepdim=True).clamp_min(1e-9)).clamp_min(1e-9).log()
+        if taid_space == "logit":
+            t_lp = F.log_softmax((1.0 - lam) * s_lp.detach() + lam * t_lp, -1)
+        else:
+            q0 = (1.0 - lam) * s_lp.exp().detach() + lam * t_lp.exp()
+            t_lp = (q0 / q0.sum(-1, keepdim=True).clamp_min(1e-9)).clamp_min(1e-9).log()
+
     def D(a_lp, b_lp):
         """Divergence from target a to model b, in nats, in the chosen mode."""
         if mode == "forward":
@@ -249,28 +271,49 @@ def _chunk_div_terms(h_s_c, h_t_c, W_lm, mode="forward", lam=1.0,
                           + (b_lp.exp() * (b_lp - m)).sum(-1))
         raise ValueError(mode)
 
-    out = D(t_lp, s_lp)
-    if ce_beta != 0.0 and tgt_c is not None:
-        # The data term, expressed as EXCESS over the teacher:
-        #
-        #     D(y || student) - D(y || teacher)
-        #
-        # Same divergence, same units, and exactly zero when the student equals
-        # the teacher -- so it sits on the first term's scale by construction
-        # and beta = 1 is meaningful rather than a number someone picked. It
-        # goes NEGATIVE when the student beats the teacher on the true token,
-        # which is the only mechanism here that can pass the teacher at all:
-        # pure distillation caps the student at teacher quality.
-        #
-        # y is smoothed by eps toward uniform purely so reverse KL is finite --
-        # D(y || p) with a hard one-hot is infinite in that direction, which is
-        # why a plain CE term cannot be swapped between divergences.
-        V = s_lp.shape[-1]
-        y_lp = torch.full_like(s_lp, math.log(CE_EPS / V))
-        y_lp.scatter_(-1, tgt_c.view(-1, 1).long(),
-                      math.log(1.0 - CE_EPS + CE_EPS / V))
-        out = out + ce_beta * (D(y_lp, s_lp) - D(y_lp, t_lp))
-    return out
+    return torch.stack([D(t_lp, s_lp), data])
+
+
+class TAIDSchedule:
+    """TAID's adaptive interpolation coefficient, as in the reference code
+    (SakanaAI/TAID, distil_losses/taid.py):
+
+        delta  = (J_prev - J) / J_prev          relative drop in the distil loss
+        m      = beta m + (1 - beta) delta
+        t_next = min(t_end, max(t_linear(step), t + alpha sigmoid(m) (1 - t)))
+
+    t_linear ramps t_start -> t_end over the run, so the schedule is never
+    slower than linear and speeds up while the loss is falling. Defaults are the
+    reference's: t_start 0.4, t_end 1.0, alpha 5e-4, beta 0.99.
+
+    The previous implementation was a linear ramp from 0: at step 1 the target
+    was 1/steps of the way to the teacher, which in prob space is ~0 signal, and
+    it had no adaptive term at all.
+    """
+
+    def __init__(self, total, t_start=0.4, t_end=1.0, alpha=5e-4, beta=0.99,
+                 adaptive=True):
+        self.total, self.t_start, self.t_end = total, t_start, t_end
+        self.alpha, self.beta, self.adaptive = alpha, beta, adaptive
+        self.t, self.m, self.prev = t_start, 0.0, None
+
+    def update(self, step, J):
+        lin = self.t_start + (self.t_end - self.t_start) * min(1.0, step / max(self.total, 1))
+        if self.adaptive and self.prev is not None:
+            delta = (self.prev - J) / (self.prev + 1e-15)
+            self.m = self.beta * self.m + (1.0 - self.beta) * delta
+            step_t = self.alpha * (1.0 / (1.0 + math.exp(-self.m))) * (1.0 - self.t)
+            self.t = min(self.t_end, max(lin, self.t + step_t))
+        else:
+            self.t = min(self.t_end, max(lin, self.t))
+        self.prev = J
+        return self.t
+
+    def state_dict(self):
+        return {"t": self.t, "m": self.m, "prev": self.prev}
+
+    def load_state_dict(self, d):
+        self.t, self.m, self.prev = d["t"], d["m"], d["prev"]
 
 
 def _chunk_fullkl_terms(h_s_c, h_t_c, W_lm):
@@ -312,7 +355,7 @@ def _chunk_ce_terms(h_c, W_lm, tgt_c):
     return F.cross_entropy((h_c @ W_lm.T).float(), tgt_c, reduction="none")
 
 
-def save_resume(path, model, opt, sched, step, gens, save_bases=False):
+def save_resume(path, model, opt, sched, step, gens, save_bases=False, taid=None):
     """Everything needed to continue a run exactly where it stopped.
 
     Weight checkpoints alone are NOT resumable: restarting from them re-inits the
@@ -340,7 +383,8 @@ def save_resume(path, model, opt, sched, step, gens, save_bases=False):
                 "weights": {n: _sd[n].detach().cpu() for n in sorted(_keep)},
                 "opt": opt.state_dict(),
                 "sched": sched.state_dict(),
-                "gens": {k: g.get_state() for k, g in gens.items()}}, path)
+                "gens": {k: g.get_state() for k, g in gens.items()},
+                "taid": taid.state_dict() if taid is not None else None}, path)
 
 
 def batches(ids, seq_len_fn, steps, seed=0, align=1, gen=None, spans=None):
@@ -740,20 +784,69 @@ def main():
                          "full-rank row-scaling capacity that rank-r LoRA "
                          "cannot express -- the DoRA magnitude component. Only "
                          "non-redundant where the branch output is LoRA-only.")
+    ap.add_argument("--teacher", default=TEACHER,
+                    help="teacher checkpoint. Must share the student's vocabulary. "
+                         "Default is MERCURIUS_TEACHER (qwen3.5-27b); pass the "
+                         "student's own original for self-distillation.")
+    ap.add_argument("--teacher-bits", type=int, default=4, choices=[4, 16],
+                    help="load the teacher NF4 (4) or bf16 (16). Its lm_head "
+                         "and embeddings stay bf16 either way.")
+    ap.add_argument("--student-bits", type=int, default=4, choices=[4, 16],
+                    help="after surgery, quantize every FROZEN Linear of the "
+                         "student to NF4. Trainable weights (adapters, MLA "
+                         "latents, per-head maps, norms, gates) are never "
+                         "quantized, and neither are the tied embeddings or the "
+                         "decay/erase/write gate projections (numerically "
+                         "sensitive: they feed a cumulative log-decay).")
+    ap.add_argument("--taid-space", default="auto", choices=["auto", "logit", "prob"],
+                    help="TAID interpolation space. auto picks the one that is "
+                         "not degenerate for --divergence (forward: logit, the "
+                         "paper's; reverse: prob, i.e. skew reverse KL). The "
+                         "other choice reduces TAID to a loss-scale ramp and is "
+                         "refused unless named explicitly.")
+    ap.add_argument("--taid-start", type=float, default=0.4)
+    ap.add_argument("--taid-end", type=float, default=1.0)
+    ap.add_argument("--taid-alpha", type=float, default=5e-4)
+    ap.add_argument("--taid-beta", type=float, default=0.99)
+    ap.add_argument("--taid-linear", action="store_true",
+                    help="linear t_start -> t_end, no adaptive term")
+    ap.add_argument("--log-every", type=int, default=25)
+    ap.add_argument("--mem-cap-gb", type=float, default=56.0,
+                    help="hard cap on this process's CUDA allocator. Unified "
+                         "memory is shared with vLLM (~42 GB) and others; "
+                         "exhausting it freezes the machine instead of raising")
+    ap.add_argument("--min-avail-gb", type=float, default=12.0,
+                    help="stop cleanly if system MemAvailable falls below this")
+    ap.add_argument("--gpu-temp-pause", type=float, default=78.0)
+    ap.add_argument("--gpu-temp-resume", type=float, default=68.0)
+    ap.add_argument("--acpi-temp-pause", type=float, default=90.0)
+    ap.add_argument("--acpi-temp-resume", type=float, default=80.0)
+    ap.add_argument("--eval-gpu-start", type=float, default=62.0,
+                    help="before each eval forward (one uninterrupted burst, "
+                         "~+15C for the 27B at 8192), wait until the GPU is at "
+                         "or below this")
+    ap.add_argument("--cooldown", type=float, default=0.0,
+                    help="seconds to sleep after every step (duty cycle)")
     ap.add_argument("--tag", default="run")
     a = ap.parse_args()
 
     # Argument consistency, checked BEFORE anything touches the GPU.
-    if a.divergence in ("reverse", "js") and a.ce_beta and not a.ce_mix:
-        raise SystemExit(
-            f"--divergence {a.divergence} with --ce-beta {a.ce_beta} collapses "
-            "the student. The additive data term is KL(student || near-one-hot) "
-            "in reverse mode, which is minimised only by a POINT MASS: direct "
-            "minimisation drives entropy to 0.0000 nats. Measured on this model, "
-            "ppl@8192 went 20.377 -> 23.939 -> 104.972 in 100 steps while top-1 "
-            "held at 41.9%. Use --ce-mix W instead: mixing the target keeps the "
-            "teacher's entropy (9.69 of 10.41 nats at W=0.1) so there is nothing "
-            "to collapse toward.")
+    # (reverse/js with --ce-beta used to be refused here: the data term was the
+    # chosen divergence against a near-one-hot, which in reverse mode collapses
+    # the student to a point mass. The data term is now excess CE in every mode,
+    # which has no such collapse -- see _chunk_div_terms.)
+    if a.taid:
+        if a.divergence == "js":
+            raise SystemExit("--taid with --divergence js is not derived; use "
+                             "forward or reverse")
+        want = taid_space_for(a.divergence)
+        if a.taid_space == "auto":
+            a.taid_space = want
+        elif a.taid_space != want:
+            print(f"  WARNING: --taid-space {a.taid_space} with --divergence "
+                  f"{a.divergence} makes TAID an exact loss-scale ramp, not an "
+                  f"interpolated target (taid_space_for). Running it because "
+                  f"you named it.", flush=True)
     if a.relora_every and not a.save_merged_bases:
         raise SystemExit(
             "--relora-every merges adapters into the frozen bases mid-run, and "
@@ -762,6 +855,18 @@ def main():
             "would produce a checkpoint that cannot be rebuilt at all. Re-run "
             "with --save-merged-bases (about 0.95 GB per checkpoint).")
 
+    from mercurius.paths import ensure_dirs
+    from mercurius import guard
+    ensure_dirs()
+    _frac, _tot = guard.cap_cuda_memory(a.mem_cap_gb)
+    print(f"  memory: CUDA allocator capped at {a.mem_cap_gb:.0f} of {_tot:.0f} GiB "
+          f"unified; system MemAvailable {guard.mem_available_gb():.1f} GiB "
+          f"(floor {a.min_avail_gb:.0f})", flush=True)
+    if guard.mem_available_gb() < a.mem_cap_gb + a.min_avail_gb:
+        raise SystemExit(
+            f"refusing to start: MemAvailable {guard.mem_available_gb():.1f} GiB "
+            f"is below cap {a.mem_cap_gb:.0f} + floor {a.min_avail_gb:.0f}. Other "
+            f"processes share this unified memory; free some or lower --mem-cap-gb.")
     torch.manual_seed(0)
     tok = AutoTokenizer.from_pretrained(CKPT)
     # DIFFERENT corpora: training on the eval set would make perplexity measure
@@ -793,13 +898,39 @@ def main():
     print(f"epochs over train corpus: "
           f"{a.steps * a.seq / len(train_ids):.3f}", flush=True)
 
-    # ---- teacher: the ORIGINAL model, untouched and frozen ----
-    teacher = AutoModelForCausalLM.from_pretrained(
-        ORIG, dtype=torch.bfloat16, device_map="cuda").eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
+    def load_teacher():
+        """The teacher may be a different, larger member of the family, with its
+        own output head (see _chunk_div_terms). Loaded AFTER the student's
+        surgery and quantization, so the student's transient bf16 peak and the
+        teacher never coexist -- on a shared unified-memory board the order of
+        these two allocations is the difference between fitting and not."""
+        # The teacher may be a different, larger member of the family. It gets its
+        # own output head (see _chunk_div_terms) and is loaded NF4 by default: a
+        # 27B in bf16 is 54 GB before activations. bitsandbytes leaves lm_head and
+        # the embeddings unquantized, so the logits it supervises with are bf16.
+        if a.teacher_bits == 4:
+            # Streamed straight into NF4, one tensor at a time (stream_nf4). The
+            # from_pretrained + BitsAndBytesConfig path staged >39 GiB loading the
+            # 27B and was OOM-killed on this shared unified-memory board; streaming
+            # peaks at 14.8 GiB. NF4 weights are bit-identical to that path.
+            from mercurius.models.stream_nf4 import load_nf4
+            teacher = load_nf4(a.teacher).eval()
+        else:
+            teacher = AutoModelForCausalLM.from_pretrained(
+                a.teacher, dtype=torch.bfloat16, device_map="cuda").eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        _tv = teacher.get_output_embeddings().weight.shape[0]
+        if _tv != len(tok) and _tv < len(tok):
+            raise SystemExit(f"teacher vocabulary {_tv} is smaller than the "
+                             f"tokenizer's {len(tok)}; teacher and student must share it")
+        print(f"  teacher: {a.teacher.rstrip('/').split('/')[-1]} "
+              f"({'NF4' if a.teacher_bits == 4 else 'bf16'}), "
+              f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB resident", flush=True)
+        return teacher
 
     if a.build_cache:
+        teacher = load_teacher()
         n = build_cache(teacher, train_ids, a.build_cache, k=a.topk,
                         seq=a.seq, n_tokens=a.cache_tokens)
         print(f"cache built: {n:,} tokens -- rerun with --logit-cache {a.build_cache}")
@@ -845,7 +976,10 @@ def main():
         print(f"  state passing enabled on {n_sp} KDA layers", flush=True)
 
     if a.grad_checkpoint:
-        student.gradient_checkpointing_enable()
+        # Non-reentrant: with the embeddings frozen, the reentrant variant sees
+        # no input requiring grad and silently returns no gradients.
+        student.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
         student.config.use_cache = False
         print("  gradient checkpointing enabled", flush=True)
 
@@ -1081,6 +1215,26 @@ def main():
         n_tr += sum(p.numel() for n, p in student.named_parameters()
                     if n.endswith(".R") and p.requires_grad)
 
+    if a.student_bits == 4:
+        # LAST structural change, after everything that reads weights: the MLA
+        # factorization, adapter merges and the GDN-2 tiling all need the bases
+        # in high precision, which is why every stage runs before this.
+        from mercurius.models.quantize import quantize_frozen_nf4
+        nq, nkeep = quantize_frozen_nf4(student)
+        torch.cuda.empty_cache()
+        print(f"  student: {nq} frozen Linear -> NF4, {nkeep} kept bf16; "
+              f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB resident "
+              f"(teacher + student)", flush=True)
+
+    teacher = load_teacher()
+    pacer = guard.ThermalPacer(a.gpu_temp_pause, a.gpu_temp_resume,
+                               a.acpi_temp_pause, a.acpi_temp_resume)
+    print(f"  thermal pacer on {pacer.attach(student) + pacer.attach(teacher)} "
+          f"decoder layers (pause {a.gpu_temp_pause:g}C -> resume "
+          f"{a.gpu_temp_resume:g}C, checked before every layer)", flush=True)
+    print(f"  after teacher: {torch.cuda.memory_allocated() / 2**30:.1f} GiB allocated, "
+          f"system MemAvailable {guard.mem_available_gb():.1f} GiB", flush=True)
+
     params = trainable_parameters(student)
     print(f"  trainable: {n_tr/1e6:.2f} M params in {len(params)} tensors", flush=True)
 
@@ -1157,7 +1311,14 @@ def main():
         print(f"  pull-to-init {a.pull_to_init:g} on {len(pull_ref)} inherited "
               f"tensors ({mb:.2f} GB reference copy)", flush=True)
 
-    hist = {"loss": [], "eval": []}
+    taid = (TAIDSchedule(a.steps, a.taid_start, a.taid_end, a.taid_alpha,
+                         a.taid_beta, adaptive=not a.taid_linear)
+            if a.taid else None)
+    if taid is not None:
+        print(f"  TAID: {a.taid_space} space, t {a.taid_start:g} -> "
+              f"{a.taid_end:g}, {'linear' if a.taid_linear else 'adaptive'}",
+              flush=True)
+    hist = {"loss": [], "div": [], "data": [], "taid_t": [], "eval": []}
     _best = {"ppl": float("inf"), "step": -1}
 
     def evaluate(step):
@@ -1168,7 +1329,10 @@ def main():
         row = {"step": step}
         print(f"  [eval @ {step:>4}]", flush=True)
         for n in (2048, 8192):
-            m = ce_and_topk(student, eval_ids, n, teacher=teacher)
+            m = ce_and_topk(student, eval_ids, n, teacher=teacher,
+                            before_forward=lambda: guard.cool_to(
+                                a.eval_gpu_start, a.acpi_temp_resume,
+                                log=lambda msg: print(msg, flush=True)))
             row[n] = m
             report(f"@{n}", m)
         if a.gen:
@@ -1198,8 +1362,7 @@ def main():
         try:
             st = os.statvfs("/")
             if st.f_bavail * st.f_frsize > 8 * 2**30:      # keep 8 GiB headroom
-                ck = (f"ckpt/"
-                      f"adapters-{a.tag}-best.pt")
+                ck = (str(CKPT_DIR / f"adapters-{a.tag}-best.pt"))
                 if improved:
                     save_trainable(student, ck, a.save_merged_bases)
                     print(f"    best so far: ppl@8192 {cur:.3f} -> {ck.split('/')[-1]}",
@@ -1209,9 +1372,10 @@ def main():
                                    a.save_merged_bases)
                 # Overwritten each eval, so it stays ~1.1 GiB rather than growing.
                 if step > 0 and _resume_ctx:
-                    save_resume(f"ckpt/resume-{a.tag}.pt",
+                    save_resume(str(CKPT_DIR / f"resume-{a.tag}.pt"),
                                 student, _resume_ctx["opt"], _resume_ctx["sched"],
-                                step, _resume_ctx["gens"], a.save_merged_bases)
+                                step, _resume_ctx["gens"], a.save_merged_bases,
+                                _resume_ctx["taid"])
             else:
                 print("    (skipping checkpoint: under 8 GiB free)", flush=True)
         except Exception as e:
@@ -1234,7 +1398,8 @@ def main():
     # after opt/sched, but before any evaluate(step>0) call -- evaluate(0) runs
     # earlier and short-circuits on `step > 0`, so the name is never looked up
     # then. Closures resolve at call time, not definition time.
-    _resume_ctx = {"opt": opt, "sched": sched, "gens": {"mix": _g, "batch": _bg}}
+    _resume_ctx = {"opt": opt, "sched": sched, "gens": {"mix": _g, "batch": _bg},
+                   "taid": taid}
     if a.length_mix:
         global LENGTH_MIX
         # --live-teacher also has no cache, but it does NOT need the cap: its
@@ -1333,6 +1498,8 @@ def main():
         sched.load_state_dict(_rs["sched"])
         _g.set_state(_rs["gens"]["mix"])
         _bg.set_state(_rs["gens"]["batch"])
+        if taid is not None and _rs.get("taid"):
+            taid.load_state_dict(_rs["taid"])
         start_step = int(_rs["step"])
         print(f"  RESUMED from {a.resume.split('/')[-1]} at step {start_step}/{a.steps} "
               f"(optimizer moments, LR position and sampler RNG restored)", flush=True)
@@ -1343,7 +1510,16 @@ def main():
     for step, (batch, new_doc, batch_offset) in enumerate(gen, start=start_step + 1):
         # TAID's target walks from the student's own distribution to the
         # teacher's as training proceeds; ignored by the other modes
-        _taid_lam = min(1.0, step / max(a.steps, 1)) if a.taid else 1.0
+        _taid_lam = taid.t if taid is not None else 1.0
+        guard.wait_until_cool(a.gpu_temp_pause, a.gpu_temp_resume,
+                              a.acpi_temp_pause, a.acpi_temp_resume,
+                              log=lambda m: print(m, flush=True))
+        _av = guard.mem_available_gb()
+        if _av < a.min_avail_gb:
+            print(f"  STOPPING at step {step}: MemAvailable {_av:.1f} GiB below "
+                  f"the {a.min_avail_gb:.0f} GiB floor. Resume from the last "
+                  f"resume file.", flush=True)
+            break
         if a.state_passing and new_doc:
             reset_state(student)
         x = batch.cuda()
@@ -1354,8 +1530,9 @@ def main():
         if a.grad_checkpoint:
             want = x.shape[1] > a.ckpt_above
             if want != _ckpt_on[0]:
-                (student.gradient_checkpointing_enable() if want
-                 else student.gradient_checkpointing_disable())
+                (student.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False})
+                 if want else student.gradient_checkpointing_disable())
                 student.config.use_cache = False
                 _ckpt_on[0] = want
         L = x.shape[1]
@@ -1367,20 +1544,27 @@ def main():
             with torch.no_grad():
                 h_t = get_trunk(teacher)(input_ids=x).last_hidden_state[0]
             h_s = get_trunk(student)(input_ids=x).last_hidden_state[0]
-            W_lm = student.lm_head.weight
+            W_s = student.get_output_embeddings().weight
+            W_t = teacher.get_output_embeddings().weight
             # position p predicts token p+1, so the last position has no target
-            # and is dropped -- 1 of 8192, and it keeps the CE mix well defined
+            # and is dropped -- 1 of 8192, and it keeps the data term defined
             nxt = x[0, 1:]
             tot, n = 0.0, 0
             for i in range(0, L - 1, a.fullkl_chunk):
                 j = min(i + a.fullkl_chunk, L - 1)
                 terms = checkpoint(_chunk_div_terms, h_s[i:j], h_t[i:j],
-                                   W_lm, a.divergence, _taid_lam,
-                                   nxt[i:j], a.ce_beta, a.ce_mix,
+                                   W_s, W_t, a.divergence, _taid_lam,
+                                   nxt[i:j], a.ce_beta, a.ce_mix, a.taid_space,
                                    use_reentrant=False)
-                tot = tot + terms.sum()
+                tot = tot + terms.sum(-1)
                 n += j - i
-            loss = tot / max(n, 1)
+            div_term, data_term = tot[0] / max(n, 1), tot[1] / max(n, 1)
+            loss = div_term + a.ce_beta * data_term
+            hist["div"].append(div_term.item())
+            hist["data"].append(data_term.item())
+            hist["taid_t"].append(_taid_lam)
+            if taid is not None:
+                taid.update(step, div_term.item())
             del h_t
         elif cache is not None:
             # cached path: no teacher forward, and KL restricted to the
@@ -1459,27 +1643,39 @@ def main():
             try:
                 _stv = os.statvfs("/")
                 if _stv.f_bavail * _stv.f_frsize > 8 * 2**30:
-                    save_resume(f"ckpt/resume-{a.tag}.pt",
+                    save_resume(str(CKPT_DIR / f"resume-{a.tag}.pt"),
                                 student, _resume_ctx["opt"], _resume_ctx["sched"],
-                                step, _resume_ctx["gens"], a.save_merged_bases)
+                                step, _resume_ctx["gens"], a.save_merged_bases,
+                                _resume_ctx["taid"])
             except Exception as _e:
                 print(f"  (resume save failed at step {step}: {_e})", flush=True)
         del t_logits, s_logits
-        if step % 25 == 0:
+        if step % a.log_every == 0:
             el = time.perf_counter() - t0
             tok_s = seen / el
-            print(f"  step {step:>4}/{a.steps}  KL {loss.item():8.4f}  "
-                  f"{tok_s:6.1f} tok/s  {el/60:5.1f} min", flush=True)
+            extra = (f"  div {hist['div'][-1]:.4f}  data(excess CE) "
+                     f"{hist['data'][-1]:+.4f}  taid t {_taid_lam:.3f}"
+                     if hist["div"] else "")
+            _g, _a = guard.temps()
+            print(f"  step {step:>4}/{a.steps}  loss {loss.item():8.4f}{extra}  "
+                  f"{tok_s:6.1f} tok/s  {el/60:5.1f} min  | paced "
+                  f"{pacer.paused_s / max(el, 1e-9):4.0%} ({pacer.n_pauses})  "
+                  f"{pacer.power_w():4.0f} W  GPU {_g:.0f}C "
+                  f"ACPI {_a:.0f}C  avail {guard.mem_available_gb():.0f} GiB  "
+                  f"peak {torch.cuda.max_memory_allocated()/2**30:.1f} GiB",
+                  flush=True)
         if step % a.eval_every == 0:
             evaluate(step)
         torch.cuda.empty_cache()
+        if a.cooldown:
+            time.sleep(a.cooldown)
 
     evaluate(a.steps)
-    out = f"logs/recovery-{a.tag}.json"
+    out = str(LOGS_DIR / f"recovery-{a.tag}.json")
     json.dump({"args": vars(a), **hist}, open(out, "w"), indent=2)
     # save the trained parameters -- without this a run's weights are lost and
     # only the eval curve survives.
-    adp = f"ckpt/adapters-{a.tag}.pt"
+    adp = str(CKPT_DIR / f"adapters-{a.tag}.pt")
     n_saved = save_trainable(student, adp, a.save_merged_bases)
     print(f"  saved {n_saved} trainable tensors", flush=True)
     print(f"\nwrote {out}\nwrote {adp}")

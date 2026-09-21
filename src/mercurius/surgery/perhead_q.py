@@ -27,9 +27,18 @@ already materialised, this only stops forcing them to be equal.
 
 Identity at init: R_h = I for every head, so the wrapper is a no-op until trained.
 
-q_proj emits [query | gate] concatenated (Qwen3.5 gates attention output with the
-second half), so the transform must touch the first half ONLY. Applying it to the
-whole tensor would silently rotate the gate as well.
+q_proj's output is laid out PER HEAD, [q_0 | g_0 | q_1 | g_1 | ...], each block
+head_dim wide: the stock forward does
+    q_proj(x).view(..., -1, head_dim * 2).chunk(2, dim=-1)
+so the transform must touch the q block of each head ONLY.
+
+FIXED 2026-09-21. This used to split the whole tensor in half with
+out.chunk(2, dim=-1), which assumed [all q | all gates]. With that layout the
+"query" half was q_0, g_0, q_1, g_1, ... for the first n_heads/2 heads: R_h for odd
+h rotated OUTPUT GATES, and heads n_heads/2 .. n_heads-1 got no map at all.
+Identity init hid it (a permuted identity is still the identity), so every
+per-head-q arm before this date, gdn2phq included, trained a different and
+half-broken mechanism.
 """
 import torch
 import torch.nn as nn
@@ -47,11 +56,11 @@ class PerHeadQ(nn.Module):
 
     def forward(self, x):
         out = self.base(x)
-        q, gate = out.chunk(2, dim=-1)              # query half | gate half
-        s = q.shape[:-1]
-        q = q.view(*s, self.n_heads, self.head_dim).float()
-        q = torch.einsum("...hd,hde->...he", q, self.R)
-        return torch.cat([q.reshape(*s, -1).to(out.dtype), gate], dim=-1)
+        s = out.shape[:-1]
+        qg = out.view(*s, self.n_heads, 2 * self.head_dim)
+        q, gate = qg.split(self.head_dim, dim=-1)  # per head: query | gate
+        q = torch.einsum("...hd,hde->...he", q.float(), self.R).to(out.dtype)
+        return torch.cat([q, gate], dim=-1).reshape(*s, -1)
 
 
 @torch.no_grad()

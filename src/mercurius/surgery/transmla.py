@@ -14,8 +14,8 @@ architectural alignment more than a memory win.
 TWO THINGS THAT MAKE THIS SAFE HERE:
 
   * We never touch q_proj. Qwen3.5 sets attn_output_gate=true, so q_proj is
-    (4096, 1024) where only the first 2048 rows are Q and the rest is the fused
-    output gate; naive head-merging corrupts it. Compressing only K and V
+    (2 * n_heads * head_dim, d_model), laid out per head as [q_h | gate_h],
+    so half its rows are the output gate; naive head-merging corrupts it. Compressing only K and V
     sidesteps that entirely -- the gate is never in the factorization.
 
   * Balanced scaling before SVD. K and V have different magnitudes, and a joint

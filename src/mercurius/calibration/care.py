@@ -37,16 +37,28 @@ LORA_RULES = [
 LENGTHS = [2048, 8192, 32768]
 
 
-def build():
+def build(adapters=None, gdn2=False, seed_alpha=None):
+    """The model whose attention inputs the MLA factorization is fitted to.
+
+    Mirrors the trainer's order up to the MLA conversion: stage A+B, decay
+    seed, NoPE dial, optional GDN-2 lift (exact, so it only matters for
+    bit-for-bit agreement with the trainer), then any adapters. With
+    adapters=None this is the untrained converted model -- the state the
+    trainer converts from when it runs every stage in one go.
+    """
     m = load_kda_model(CKPT, dtype=torch.bfloat16)
     for l in get_trunk(m).layers:
         if hasattr(l, "linear_attn"):
-            l.linear_attn.seed_decay_from_rope(target_alpha=None)
+            l.linear_attn.seed_decay_from_rope(target_alpha=seed_alpha)
     install_rope_dial(m, 0, "global")
-    inject_lora(m, LORA_RULES, verbose=False)
-    freeze_base(m)
-    sd = torch.load(ADAPTERS, map_location="cpu")
-    m.load_state_dict({k: v.cuda() for k, v in sd.items()}, strict=False)
+    if gdn2:
+        from mercurius.models.gdn2 import convert_to_gdn2
+        convert_to_gdn2(m, verbose=False)
+    if adapters:
+        inject_lora(m, LORA_RULES, verbose=False)
+        freeze_base(m)
+        sd = torch.load(adapters, map_location="cpu")
+        m.load_state_dict({k: v.cuda() for k, v in sd.items()}, strict=False)
     return m.eval()
 
 
@@ -120,7 +132,7 @@ def main():
 
     print("=== baseline (NoPE trained, no MLA) ===")
     print(hdr, flush=True)
-    m = build()
+    m = build(ADAPTERS)
     rows = [measure(m, ids, needle, "baseline")]
     base = rows[0]
 
@@ -133,7 +145,7 @@ def main():
     print(hdr, flush=True)
     for d_c in (729, 512, 384, 256):
         for use_cov, label in ((False, "plain SVD"), (True, "CARE whitened")):
-            m = build()
+            m = build(ADAPTERS)
             convert_to_mla(m, d_c=d_c, verbose=False,
                            covs=covs if use_cov else None)
             r = measure(m, ids, needle, f"d_c={d_c:<4} {label}")
