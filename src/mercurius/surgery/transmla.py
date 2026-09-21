@@ -316,7 +316,7 @@ def whitened_spectra(model, covs):
 
 
 def convert_to_mla(model, d_c=None, energy=0.95, blend=False, verbose=True,
-                   covs=None, budget=None, v_metric=False):
+                   covs=None, budget=None, v_metric=False, alloc=None):
     """Replace k_proj/v_proj on every full-attention layer with a shared latent.
 
     d_c=None selects per-layer ranks by spectral energy; an int forces one rank
@@ -330,7 +330,14 @@ def convert_to_mla(model, d_c=None, energy=0.95, blend=False, verbose=True,
             "optimises ||W - W_hat||, the objective CARE exists to replace.")
     from mercurius.surgery.norm_fusion import get_trunk
     layers = get_trunk(model).layers
-    alloc = None
+    if alloc is not None and budget is not None:
+        raise ValueError("pass alloc or budget, not both: budget recomputes an "
+                         "allocation and would discard the explicit one")
+    if alloc is not None:
+        alloc = {int(k): int(v) for k, v in alloc.items()}
+        if verbose:
+            print(f"  explicit rank allocation, total {sum(alloc.values())}: "
+                  f"{dict(sorted(alloc.items()))}", flush=True)
     if budget is not None:
         alloc = allocate_ranks(whitened_spectra(model, covs), int(budget))
         if verbose:

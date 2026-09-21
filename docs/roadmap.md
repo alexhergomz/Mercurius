@@ -85,7 +85,7 @@ is the objective that was asked for.
 Screen as three arms on the GDN-2 base: reverse+CE, reverse+CE+TAID, js+CE.
 
 
-### 1.1 Synthetic multi-item recall in the training mix
+### 1.1 Synthetic multi-item recall in the training mix  [MEASURED: findings 0.5 -- the only mechanism to improve BOTH perplexity and retrieval; weak beyond the distances the corpus teaches. Corpus now teaches 2k/4k/8k/16k/32k; running at a matched 20% share so distance is the only variable]
 **Confidence: high. Cost: low.**
 
 The model has never been trained on anything that requires retaining several
@@ -99,7 +99,7 @@ Identity init: none needed, it is a data change. Risk: over-fitting to the
 synthetic format, which is why it should be a small fraction of the mix and
 NOLEX/RULER must stay held out in distribution.
 
-### 1.2 On-policy distillation (GKD)
+### 1.2 On-policy distillation (GKD)  [findings 0.5b -- the first attempt failed because rollouts were generic prose. Now anchored at restatement headers and verified firing (findings 0.6); under test]
 **Confidence: high. Cost: medium.**
 
 Fact 4 is exposure bias, and the known fix is to train on sequences the student
@@ -294,6 +294,24 @@ longest-memory channels get the least resolution.
 All 6 MLA layers use d_c = 256 uniformly. The measured spectra differ per layer,
 so allocating the same total budget unevenly should recover quality for free.
 The machinery exists (allocate_ranks) and its priority function has been fixed.
+
+Two allocation objectives now exist and they disagree. `allocate_ranks` minimises
+total truncation error, which is indifferent to what a layer is FOR; it hands the
+largest share (314 of 1536) to layer 3. Measured retrieval scores say layer 3
+retrieves LEAST (mean 0.219) and layers 15 and 19 retrieve most (0.885, 0.826) --
+see findings 0.7. `allocate_ranks_retrieval` weights the same water-filling by
+retrieval score.
+
+Granularity matters here: 8 query heads but 2 KV heads per layer means grouping
+inside a layer is already per-KV-head, which is the M-LRD variant Palu
+(2407.21118) reports degrades. Across layers is the axis with room.
+
+Screening cheaply first, because d_c reshapes the latent and adapters trained at
+256 cannot transfer, so a clean comparison costs one full training arm per
+allocation. `src/alloc_screen.py` converts stage-AB at each allocation with NO
+adapters and measures retrieval directly, which isolates the allocation's own
+cost with no adapter-mismatch confound. Pre-recovery numbers rank allocations;
+they do not predict trained accuracy. A separating screen buys the training arms.
 
 ---
 

@@ -52,6 +52,8 @@ MODULES = {
     "nolex_data": "mercurius.eval.nolex_data",
     "nolex": "mercurius.eval.nolex",
     "verify_checkpoint": "mercurius.eval.verify_checkpoint",
+    "retrieval_heads": "mercurius.eval.retrieval_heads",
+    "alloc_screen": "mercurius.eval.alloc_screen",
 }
 
 PATHS = [

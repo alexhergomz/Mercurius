@@ -49,11 +49,41 @@ def gold_string(outputs):
     return " " + ", ".join(outputs[:-1]) + ", and " + outputs[-1]
 
 
+def gold_value_mask(outputs, tok):
+    """Tokenize the gold continuation ONCE, and mark which tokens are values.
+
+    Averaging the likelihood over the whole span dilutes the only tokens that
+    require retrieval. Across three arms whose exact match spans 9.8 points, the
+    full-span NLL spanned 0.001 nats -- effectively blind. Same averaging failure
+    LongPPL identifies for long-context perplexity (arXiv:2410.23771): likelihood
+    on ANSWER tokens tracks long-context accuracy, likelihood on the surrounding
+    tokens does not. Here the surroundings are ", " and ", and ", which every arm
+    predicts perfectly and which therefore pull every arm to the same number.
+
+    The mask is built from CHARACTER OFFSETS, not by tokenizing each piece
+    separately. Piecewise tokenization changes the sequence: a leading space
+    merges with the first character of a value, so " e4a1..." is [378, 19, ...]
+    whole but [220, 68, 19, ...] in pieces. Scoring pieces would measure a
+    sequence the model never sees -- verified on numbers and uuids alike.
+    """
+    gold = gold_string(outputs)
+    enc = tok(gold, add_special_tokens=False, return_offsets_mapping=True)
+    ids = list(enc["input_ids"])
+    spans, at = [], 0
+    for o in outputs:
+        i = gold.index(o, at)
+        spans.append((i, i + len(o)))
+        at = i + len(o)
+    mask = [any(a < e and b > s for s, e in spans)
+            for (a, b) in enc["offset_mapping"]]
+    return ids, mask
+
+
 @torch.no_grad()
 def score_sample(model, tok, s, gen_tokens):
     prompt_ids = tok(s["input"] + s["answer_prefix"]).input_ids
     gold = gold_string(s["outputs"])
-    gold_ids = tok(gold, add_special_tokens=False).input_ids
+    gold_ids, val_mask = gold_value_mask(s["outputs"], tok)
     if gen_tokens < 0:
         # Budget the generation to the ANSWER, per sample. A flat cap silently
         # truncates the long answers: a uuid is ~25 tokens and four numbers with
@@ -76,7 +106,11 @@ def score_sample(model, tok, s, gen_tokens):
     out = model(input_ids=ids, logits_to_keep=k)
     sl = out.logits[0, :-1].float()
     assert sl.shape[0] == len(gold_ids), (sl.shape, len(gold_ids))
-    nll = F.cross_entropy(sl, ids[0, np_:], reduction="mean").item()
+    per_tok = F.cross_entropy(sl, ids[0, np_:], reduction="none")
+    nll = per_tok.mean().item()                      # whole span, as before
+    m = torch.tensor(val_mask, device=per_tok.device)
+    # values only: the tokens that actually require having retrieved something
+    nll_v = per_tok[m].mean().item() if bool(m.any()) else nll
     del out
     torch.cuda.empty_cache()
 
@@ -88,7 +122,7 @@ def score_sample(model, tok, s, gen_tokens):
         pred = tok.decode(g[0, pi.shape[1]:], skip_special_tokens=True)
         del g
         torch.cuda.empty_cache()
-    return nll, pred
+    return nll, nll_v, pred
 
 
 def main():
@@ -108,9 +142,26 @@ def main():
     ap.add_argument("--init-adapters",
                     default=str(CKPT_DIR / 'adapters-combined.pt'))
     ap.add_argument("--dc", type=int, default=256)
+    ap.add_argument("--alloc", default=None,
+                    help="explicit per-layer d_c as a JSON dict or a path to one; "
+                         "a retrieval_heads.json is accepted and the key named by "
+                         "--alloc-key is used. Overrides --dc.")
+    ap.add_argument("--alloc-key", default="retrieval",
+                    help="which allocation inside a retrieval_heads.json to use: "
+                         "uniform, spectral or retrieval")
     ap.add_argument("--covs", default=str(CACHE_DIR / 'kv_covs.pt'))
     ap.add_argument("--out", default="logs/ruler.json")
     a = ap.parse_args()
+
+    _alloc = None
+    if a.alloc:
+        import os as _o
+        _alloc = json.load(open(a.alloc)) if _o.exists(a.alloc) else json.loads(a.alloc)
+        if a.alloc_key in _alloc:
+            _alloc = _alloc[a.alloc_key]
+        _alloc = {int(k): int(v) for k, v in _alloc.items()}
+        print(f"  d_c allocation ({a.alloc_key}), total {sum(_alloc.values())}: "
+              f"{dict(sorted(_alloc.items()))}", flush=True)
 
     tok = AutoTokenizer.from_pretrained(CKPT)
 
@@ -126,23 +177,24 @@ def main():
         tag, path = spec.split("=", 1)
         t0 = time.perf_counter()
         m = (build_original() if path == "ORIGINAL"
-             else build(path, a.dc, a.covs, init_adapters=a.init_adapters))
+             else build(path, a.dc, a.covs, init_adapters=a.init_adapters,
+                        alloc=_alloc))
         res = {}
         for task in a.tasks:
             for n in a.lengths:
-                nlls, preds, refs, oom = [], [], [], 0
+                nlls, nllv, preds, refs, oom = [], [], [], [], 0
                 lim = a.em_samples or len(data[(task, n)])
                 for si, s in enumerate(data[(task, n)]):
                     # One OOM at the longest length must not destroy the whole
                     # sweep. Record the gap and carry on.
                     try:
-                        nll, pred = score_sample(
+                        nll, nll_v, pred = score_sample(
                             m, tok, s, a.gen_tokens if si < lim else 0)
                     except torch.cuda.OutOfMemoryError:
                         oom += 1
                         torch.cuda.empty_cache()
                         continue
-                    nlls.append(nll)
+                    nlls.append(nll); nllv.append(nll_v)
                     if si < lim:
                         preds.append(pred); refs.append(s["outputs"])
                 if not nlls:
@@ -154,6 +206,7 @@ def main():
                       if a.gen_tokens and preds else None)
                 res[f"{task}@{n}"] = {
                     "nll": sum(nlls) / len(nlls),
+                    "nll_v": sum(nllv) / len(nllv),
                     "em": em,
                     "n": len(nlls),
                     "n_em": len(preds),
