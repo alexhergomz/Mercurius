@@ -67,6 +67,38 @@ def rules_from_checkpoint(sd):
     return sorted(rules.items(), key=lambda kv: -len(kv[0]))
 
 
+def _fast_conv_for_stock(m):
+    """Give the stock GDN layers of an ORIGINAL arm fla's Triton causal conv.
+
+    Without the Dao-AILab causal_conv1d package (no sm_121 wheel) stock
+    transformers falls back to a PyTorch depthwise conv, 5.7x slower here; the
+    converted arms already use fla's kernel (models/kda.py). Same function, so
+    the baseline is not slowed by a missing package. Outputs agree to bf16
+    rounding (relL2 3.1e-3 on the conv alone).
+    """
+    from fla.modules.convolution import causal_conv1d
+    def conv(x, weight, bias=None, activation=None, seq_idx=None):
+        y = causal_conv1d(x=x.transpose(1, 2), weight=weight, bias=bias,
+                          activation=activation)[0]
+        return y.transpose(1, 2)
+    n = 0
+    for mod in m.modules():
+        if type(mod).__name__ == "Qwen3_5GatedDeltaNet" and mod.causal_conv1d_fn is None:
+            mod.causal_conv1d_fn = conv
+            n += 1
+    return n
+
+
+def build_original_nf4():
+    """The unmodified original, NF4 with the trainer's quantization settings --
+    the same-precision baseline for an NF4 student."""
+    from mercurius.models.stream_nf4 import load_nf4
+    from mercurius.recovery.train import ORIG
+    m = load_nf4(ORIG, verbose=False).eval()
+    _fast_conv_for_stock(m)
+    return m
+
+
 def build_original():
     """The unmodified teacher, no surgery and no adapters.
 
@@ -78,11 +110,12 @@ def build_original():
     from mercurius.recovery.train import ORIG
     m = AutoModelForCausalLM.from_pretrained(ORIG, dtype=torch.bfloat16,
                                              device_map="cuda")
+    _fast_conv_for_stock(m)
     return m.eval()
 
 
 def build(adapters, dc, covs_path, double_adapter=False, init_adapters=None,
-          alloc=None):
+          alloc=None, quantize=False, merge_eval=False):
     """Reconstruct a trained model.
 
     double_adapter reproduces the pre-2026-09-13 injection, which wrapped every
@@ -237,6 +270,31 @@ def build(adapters, dc, covs_path, double_adapter=False, init_adapters=None,
         print(f"    WARNING {len(unexpected)} checkpoint tensors had no home in "
               f"the model (e.g. {unexpected[0]}) -- the rebuild does not match "
               f"the run", flush=True)
+    if quantize:
+        # The trainer's last structural step (--student-bits 4): every FROZEN
+        # Linear to NF4. "Frozen" in the run means "not in the checkpoint",
+        # since the checkpoint is exactly the trained tensors; requires_grad
+        # here is freeze_base's default set and does not match the run's, so it
+        # cannot be the criterion. MLA latents, per-head R and norms are in the
+        # file and stay high precision; VeRA-wrapped bases are not and get NF4.
+        from mercurius.models.quantize import quantize_frozen_nf4
+        for prm in m.parameters():
+            prm.requires_grad_(False)
+        named = dict(m.named_parameters())
+        for k in sd:
+            if k in named:
+                named[k].requires_grad_(True)      # mark: keep high precision
+        nq, nkeep = quantize_frozen_nf4(m)
+        for prm in m.parameters():
+            prm.requires_grad_(False)
+        print(f"    student NF4: {nq} frozen Linear quantized, {nkeep} kept "
+              f"high precision (as trained)", flush=True)
+    if merge_eval:
+        from mercurius.adapters.lora import merge_vera_for_eval
+        nm = merge_vera_for_eval(m)
+        torch.cuda.empty_cache()
+        print(f"    merged {nm} VeRA adapters into bf16 bases for inference",
+              flush=True)
     return m.eval()
 
 

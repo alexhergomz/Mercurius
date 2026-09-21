@@ -32,7 +32,8 @@ import time
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
-from mercurius.eval.retrieval_ab import build, build_original
+from mercurius.eval.retrieval_ab import build, build_original, build_original_nf4
+from mercurius import guard
 from mercurius.recovery.train import CKPT
 from mercurius.eval import ruler_gen as R
 from mercurius.paths import CACHE_DIR, CKPT_DIR
@@ -81,47 +82,70 @@ def gold_value_mask(outputs, tok):
 
 @torch.no_grad()
 def score_sample(model, tok, s, gen_tokens):
+    """(span NLL, value-token NLL, greedy prediction) from ONE prefill.
+
+    The prompt is the whole cost at long context (a 128k prefill is minutes;
+    the answer is tens of tokens), and the previous version paid it twice: a
+    teacher-forced pass for the NLL, then generate() from scratch for EM. Here
+    the prompt is prefilled once with a cache; the gold span is scored on a
+    COPY of that cache, and greedy decoding runs on the original.
+    """
+    import copy
     prompt_ids = tok(s["input"] + s["answer_prefix"]).input_ids
-    gold = gold_string(s["outputs"])
     gold_ids, val_mask = gold_value_mask(s["outputs"], tok)
     if gen_tokens < 0:
         # Budget the generation to the ANSWER, per sample. A flat cap silently
         # truncates the long answers: a uuid is ~25 tokens and four numbers with
         # separators is ~40, so a 24-token cap reported EM 0.00% on
-        # niah_single_3 while the teacher-forced NLL was 0.064 -- the model had
-        # the answer and the metric could not see it. RULER's flat 128 is safe
-        # but pays 128 decode steps on every sample including the ones that need
-        # 8. Slack of 16 covers a short preamble before the answer.
+        # niah_single_3 while the teacher-forced NLL was 0.064. Slack of 16
+        # covers a short preamble before the answer.
         gen_tokens = len(gold_ids) + 16
-    # Concatenate TOKEN ids, not strings: tokenizing the joined text can merge
-    # across the boundary and the scored span would not be the gold span.
-    ids = torch.tensor([prompt_ids + gold_ids], device="cuda")
-    np_ = len(prompt_ids)
-    # Only the gold positions are scored, so only they need logits. Without this
-    # the lm_head runs over the whole sequence: 32% of the forward's FLOPs and a
-    # 3.8 GiB tensor at 8k, 7.6 GiB at 16k, of which ~40 rows are read.
-    # logits_to_keep=K returns the LAST K positions, so K = len(gold)+1 gives
-    # positions np_-1 .. end, and [:-1] are exactly the predictors of the gold.
-    k = len(gold_ids) + 1
-    out = model(input_ids=ids, logits_to_keep=k)
-    sl = out.logits[0, :-1].float()
-    assert sl.shape[0] == len(gold_ids), (sl.shape, len(gold_ids))
-    per_tok = F.cross_entropy(sl, ids[0, np_:], reduction="none")
-    nll = per_tok.mean().item()                      # whole span, as before
-    m = torch.tensor(val_mask, device=per_tok.device)
-    # values only: the tokens that actually require having retrieved something
-    nll_v = per_tok[m].mean().item() if bool(m.any()) else nll
+    pi = torch.tensor([prompt_ids], device="cuda")
+    out = model(input_ids=pi, use_cache=True, logits_to_keep=1)
+    first = out.logits[0, -1].float()                 # predicts gold[0]
+    cache = out.past_key_values
     del out
-    torch.cuda.empty_cache()
+
+    # NLL: gold[0] from the prompt's last position, then gold[1:] ONE TOKEN AT
+    # A TIME on a copy of the cache. Not one multi-token forward: the hybrid
+    # model only reads its linear-attention cache when seq_len == 1 (stock
+    # Qwen3.5 and our port alike), so a multi-token continuation silently
+    # restarts the recurrent state from zero -- measured NLL 2.7 against a
+    # teacher-forced 0.06. The span is ~10-40 tokens, negligible against the
+    # prefill. Token ids are concatenated, never strings.
+    g = torch.tensor([gold_ids], device="cuda")
+    logits = [first.unsqueeze(0)]
+    c2 = copy.deepcopy(cache) if len(gold_ids) > 1 else None
+    for t in range(len(gold_ids) - 1):
+        o2 = model(input_ids=g[:, t:t + 1], past_key_values=c2, use_cache=True)
+        c2 = o2.past_key_values
+        logits.append(o2.logits[0, -1:].float())
+        del o2
+    del c2
+    sl = torch.cat(logits, 0)
+    assert sl.shape[0] == len(gold_ids), (sl.shape, len(gold_ids))
+    per_tok = F.cross_entropy(sl, g[0], reduction="none")
+    nll = per_tok.mean().item()
+    m = torch.tensor(val_mask, device=per_tok.device)
+    nll_v = per_tok[m].mean().item() if bool(m.any()) else nll
 
     pred = ""
     if gen_tokens:
-        pi = torch.tensor([prompt_ids], device="cuda")
-        g = model.generate(pi, max_new_tokens=gen_tokens, do_sample=False,
-                           use_cache=True, pad_token_id=tok.eos_token_id)
-        pred = tok.decode(g[0, pi.shape[1]:], skip_special_tokens=True)
-        del g
-        torch.cuda.empty_cache()
+        # greedy decode on the original cache (experiments/test_generate_cache
+        # checks cached decoding against cache-free decoding, token for token)
+        nxt, toks = first.argmax(), []
+        for _ in range(gen_tokens):
+            t = int(nxt)
+            if t == tok.eos_token_id:
+                break
+            toks.append(t)
+            o = model(input_ids=nxt.view(1, 1), past_key_values=cache,
+                      use_cache=True)
+            cache = o.past_key_values
+            nxt = o.logits[0, -1].argmax()
+        pred = tok.decode(toks, skip_special_tokens=True)
+    del cache
+    torch.cuda.empty_cache()
     return nll, nll_v, pred
 
 
@@ -139,9 +163,17 @@ def main():
     ap.add_argument("--gen-tokens", type=int, default=-1,
                     help="-1 budgets per sample from the gold length "
                          "(recommended); 0 disables EM scoring; >0 is a flat cap")
-    ap.add_argument("--init-adapters",
-                    default=str(CKPT_DIR / 'adapters-combined.pt'))
-    ap.add_argument("--dc", type=int, default=256)
+    ap.add_argument("--init-adapters", default=None,
+                    help="replayed before the checkpoint for runs that started "
+                         "from earlier adapters (the 0.8B arms used "
+                         "ckpt/adapters-combined.pt); none for a fresh run")
+    ap.add_argument("--dc", type=int, default=512)
+    ap.add_argument("--quantize", action="store_true",
+                    help="rebuild converted arms with the trainer's NF4 step "
+                         "(--student-bits 4); ORIGINAL_NF4 is the matching baseline")
+    ap.add_argument("--mem-cap-gb", type=float, default=90.0)
+    ap.add_argument("--gpu-temp-pause", type=float, default=84.0)
+    ap.add_argument("--gpu-temp-resume", type=float, default=80.0)
     ap.add_argument("--alloc", default=None,
                     help="explicit per-layer d_c as a JSON dict or a path to one; "
                          "a retrieval_heads.json is accepted and the key named by "
@@ -149,9 +181,11 @@ def main():
     ap.add_argument("--alloc-key", default="retrieval",
                     help="which allocation inside a retrieval_heads.json to use: "
                          "uniform, spectral or retrieval")
-    ap.add_argument("--covs", default=str(CACHE_DIR / 'kv_covs.pt'))
+    ap.add_argument("--covs", default=str(CACHE_DIR / 'kv_covs_4b.pt'))
     ap.add_argument("--out", default="logs/ruler.json")
     a = ap.parse_args()
+    guard.cap_cuda_memory(a.mem_cap_gb)
+    pacer = guard.ThermalPacer(a.gpu_temp_pause, a.gpu_temp_resume, 90.0, 85.0)
 
     _alloc = None
     if a.alloc:
@@ -177,8 +211,10 @@ def main():
         tag, path = spec.split("=", 1)
         t0 = time.perf_counter()
         m = (build_original() if path == "ORIGINAL"
+             else build_original_nf4() if path == "ORIGINAL_NF4"
              else build(path, a.dc, a.covs, init_adapters=a.init_adapters,
-                        alloc=_alloc))
+                        alloc=_alloc, quantize=a.quantize))
+        pacer.attach(m)
         res = {}
         for task in a.tasks:
             for n in a.lengths:
@@ -227,6 +263,7 @@ def main():
         json.dump(rows, open(a.out, "w"), indent=1)
         print(f"  ({time.perf_counter() - t0:.0f}s, partial results in "
               f"{a.out.split('/')[-1]})\n", flush=True)
+        pacer.detach()
         del m
         torch.cuda.empty_cache()
 

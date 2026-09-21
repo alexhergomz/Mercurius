@@ -29,6 +29,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fla.ops import chunk_kda, fused_recurrent_kda
+from mercurius.models import fused as _fused
+_fused.patch_rmsnorm()
+try:
+    from fla.modules.convolution import causal_conv1d as _fla_conv
+except ImportError:
+    _fla_conv = None
 import transformers.models.qwen3_5.modeling_qwen3_5 as qm
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
 
@@ -304,16 +310,28 @@ class Qwen3_5KDAGatedDeltaNet(Qwen3_5GatedDeltaNet):
         a = self.in_proj_a(hidden_states)
         if self.lora_rank > 0:
             a = a + F.linear(F.linear(hidden_states, self.a_lora_A), self.a_lora_B)
-        a = a.unflatten(-1, (self.kda_heads, self.kda_dim))
-        return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+        # fp32 -exp(A_log) * softplus(a + dt_bias), fused (models/fused.py);
+        # bitwise identical to the eager expression, 5x faster at 32k
+        return _fused.decay(a, self.A_log, self.dt_bias)
 
     def _conv(self, mixed_qkv):
-        """Causal depthwise conv + activation over (B, C, T), no cache."""
+        """Causal depthwise conv + activation over (B, C, T), no cache.
+
+        Dao-AILab causal_conv1d when installed (it has no sm_121 wheel), else
+        fla's Triton kernel, else the PyTorch depthwise conv. The PyTorch path
+        took 27.9 ms at 32k x 8192 channels against fla's 4.9 ms, agreeing to
+        bf16 rounding (relL2 3.1e-3), and runs in every one of 24 layers.
+        """
         T = mixed_qkv.shape[-1]
         if self.causal_conv1d_fn is not None:
             return self.causal_conv1d_fn(
                 x=mixed_qkv, weight=self.conv1d.weight.squeeze(1),
                 bias=self.conv1d.bias, activation=self.activation, seq_idx=None)
+        if _fla_conv is not None and self.activation in ("silu", "swish"):
+            y = _fla_conv(x=mixed_qkv.transpose(1, 2),
+                          weight=self.conv1d.weight.squeeze(1),
+                          bias=self.conv1d.bias, activation="silu")[0]
+            return y.transpose(1, 2)
         return F.silu(self.conv1d(mixed_qkv)[:, :, :T])
 
     # Mirrors the stock Qwen3_5GatedDeltaNet.forward of the installed
@@ -328,6 +346,15 @@ class Qwen3_5KDAGatedDeltaNet(Qwen3_5GatedDeltaNet):
         use_precomputed_states = (
             cache_params is not None
             and cache_params.has_previous_state(self.layer_idx) and seq_len == 1)
+        # A multi-token forward ON TOP OF an existing cache: chunked prefill, or
+        # scoring a continuation. Stock transformers 5.6 treats any seq_len > 1
+        # as a fresh prefill, so it starts the recurrence from a ZERO state and
+        # zero-pads the conv -- silently discarding everything before the chunk
+        # (measured: gold-span NLL 2.7 where the teacher-forced value is 0.06).
+        # The recurrence accumulates, so a continuation must seed the kernel
+        # with the cached state and the conv with the cached input frames.
+        continuing = (cache_params is not None and seq_len > 1
+                      and cache_params.has_previous_state(self.layer_idx))
 
         mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
         z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
@@ -339,7 +366,17 @@ class Qwen3_5KDAGatedDeltaNet(Qwen3_5GatedDeltaNet):
                 mixed_qkv, conv_state, self.conv1d.weight.squeeze(1),
                 self.conv1d.bias, self.activation)
         else:
-            if cache_params is not None:
+            conv_pad = 0
+            if continuing:
+                # the cache holds the last k RAW (pre-conv) inputs; the new
+                # chunk's first positions need the last k-1 of them. Read before
+                # update_conv_state overwrites the buffer in place.
+                prev = cache_params.layers[self.layer_idx].conv_states[
+                    ..., 1:].to(mixed_qkv.dtype).clone()
+                cache_params.update_conv_state(mixed_qkv, self.layer_idx)
+                mixed_qkv = torch.cat([prev, mixed_qkv], dim=-1)
+                conv_pad = prev.shape[-1]
+            elif cache_params is not None:
                 conv_state = F.pad(mixed_qkv,
                                    (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
                 cache_params.update_conv_state(conv_state, self.layer_idx)
@@ -347,8 +384,7 @@ class Qwen3_5KDAGatedDeltaNet(Qwen3_5GatedDeltaNet):
             # causal Conv1d (kernel 4) sees zero padding at every segment
             # boundary instead of the previous tokens, corrupting the first few
             # q/k/v positions -- which then feed the recurrent state and compound.
-            conv_pad = 0
-            if self._state_passing:
+            if self._state_passing and not continuing:
                 if self._conv_carry is not None:
                     mixed_qkv = torch.cat([self._conv_carry, mixed_qkv], dim=-1)
                     conv_pad = self._conv_carry.shape[-1]
@@ -370,7 +406,13 @@ class Qwen3_5KDAGatedDeltaNet(Qwen3_5GatedDeltaNet):
             key = key.repeat_interleave(rep, dim=2)
 
         recurrent_state = (cache_params.layers[self.layer_idx].recurrent_states
-                           if use_precomputed_states else None)
+                           if (use_precomputed_states or continuing) else None)
+        # transformers allocates the cached recurrent state in the conv input's
+        # dtype (bf16), so it is ROUNDED to bf16 at every update; the chunk
+        # kernel requires fp32. Cast on read -- the rounding itself is the
+        # stock cache's and is not undone here.
+        if recurrent_state is not None and continuing:
+            recurrent_state = recurrent_state.float()
         if self._state_passing and self._carry is not None:
             recurrent_state = self._carry
         want_final = (cache_params is not None) or self._state_passing
