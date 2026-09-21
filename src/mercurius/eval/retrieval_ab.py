@@ -81,7 +81,8 @@ def build_original():
     return m.eval()
 
 
-def build(adapters, dc, covs_path, double_adapter=False, init_adapters=None):
+def build(adapters, dc, covs_path, double_adapter=False, init_adapters=None,
+          alloc=None):
     """Reconstruct a trained model.
 
     double_adapter reproduces the pre-2026-09-13 injection, which wrapped every
@@ -203,7 +204,8 @@ def build(adapters, dc, covs_path, double_adapter=False, init_adapters=None):
     if dc:
         covs = {int(k): v.cuda().float()
                 for k, v in torch.load(covs_path, map_location="cpu").items()}
-        convert_to_mla(m, d_c=dc, covs=covs, verbose=False)
+        convert_to_mla(m, d_c=(None if alloc else dc), alloc=alloc,
+                       covs=covs, verbose=bool(alloc))
     # Per-head query maps, if the run had them. Detected from the artifact: the
     # R tensors exist only if install_per_head_q ran, and it runs last, after the
     # MLA conversion, so the rebuild must apply it at the same point.

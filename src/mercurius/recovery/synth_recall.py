@@ -53,42 +53,78 @@ def _code(rng):
     return "".join(rng.choice("0123456789ABCDEF") for _ in range(6))
 
 
-def make_doc(rng, sentences, k, approx_tokens, tok):
-    """One document: k facts spread through real prose, restated at the end."""
-    topics = rng.sample(TOPICS, k)
-    codes = [_code(rng) for _ in topics]
-    facts = [FACT.format(topic=t, code=c) for t, c in zip(topics, codes)]
+def make_doc(rng, sentences, k, approx_tokens, tok, period_tokens=2000,
+             lags=(0, 1, 2, 3)):
+    """Periodic facts, restated at SEVERAL distances.
 
-    # real prose, enough to overshoot the window so the document earns a span
-    body, n = [], 0
-    while n < approx_tokens:
-        s = sentences[rng.randrange(len(sentences))]
-        body.append(s)
-        n += len(s.split()) * 4 // 3          # rough words->tokens
-    # spread the facts over the first 85%, so every one of them sits BEFORE the
-    # summary by a large margin rather than adjacent to it
-    for i, f in enumerate(facts):
-        pos = int(len(body) * 0.05 + (i + 1) * len(body) * 0.80 / (k + 1))
-        body.insert(min(pos, len(body)), f)
+    The first working corpus cycled facts and a restatement inside one ~2,600
+    token block, so every retention distance it taught was ~1,800-2,300. The model
+    learned exactly that: measured at n=40 on multivalue, 99.4% at 4k, 87.5% at
+    8k, 64.4% at 16k -- near-saturated where the corpus taught and weakest where
+    it did not (findings 0.5).
 
-    order = list(range(k))
-    rng.shuffle(order)                        # restate in a DIFFERENT order
-    tail = [SUMMARY_HEAD] + [SUMMARY_LINE.format(topic=topics[i], code=codes[i])
-                             for i in order]
-    return " ".join([LEAD] + body) + "\n" + "\n".join(tail)
+    Here group g's facts are planted at the start of period g, and the END of each
+    period restates the groups `lags` periods back. With period 2000 and lags
+    (0,1,2,3) the distances taught are roughly 2k, 4k, 6k and 8k, spanning the
+    whole training window instead of clustering at its short end.
+
+    Restatements still use a shuffled order, so predicting them requires having
+    retained the facts rather than copying a nearby span.
+    """
+    n_periods = max(len(lags) + 2, approx_tokens // period_tokens)
+    groups = []
+    parts = [LEAD]
+    for g in range(n_periods):
+        topics = rng.sample(TOPICS, k)
+        codes = [_code(rng) for _ in topics]
+        groups.append((topics, codes))
+        body, n = [], 0
+        while n < period_tokens:
+            s = sentences[rng.randrange(len(sentences))]
+            body.append(s)
+            n += len(s.split()) * 4 // 3
+        # facts at the START of the period, so the distance to a restatement at
+        # the end of period g+lag is about (lag+1) * period_tokens
+        for i, (tp, cd) in enumerate(zip(topics, codes)):
+            pos = int(len(body) * 0.02 + i * len(body) * 0.06 / max(k, 1))
+            body.insert(min(pos, len(body)), FACT.format(type_needle_v="numbers",
+                                                         topic=tp, code=cd)
+                        if False else FACT.format(topic=tp, code=cd))
+        parts.append(" ".join(body))
+        for lag in lags:
+            src = g - lag
+            if src < 0:
+                continue
+            tps, cds = groups[src]
+            order = list(range(len(tps)))
+            rng.shuffle(order)
+            parts.append(SUMMARY_HEAD + " "
+                         + "; ".join(SUMMARY_LINE.format(topic=tps[i],
+                                                         code=cds[i])
+                                     for i in order))
+    return " ".join(parts)
 
 
 def build_corpus(src_path, out_path, tok, n_docs=120, k_range=(2, 8),
-                 approx_tokens=8600, seed=0, src_chars=8_000_000):
+                 approx_tokens=16000, seed=0, src_chars=8_000_000,
+                 period_tokens=2000, lags=(0, 1, 2, 3)):
     """Write n_docs synthetic documents, blank-line separated for the loader."""
     raw = open(src_path, encoding="utf-8", errors="replace").read(src_chars)
-    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', raw)
-                 if 40 < len(s.strip()) < 400]
+    # Collapse ALL whitespace inside a sentence. "\n\n" is the document
+    # separator tokenize_by_document splits on, so a source sentence containing a
+    # blank line silently splits the document it lands in: the first corpus wrote
+    # 300 documents and the loader saw 476 fragments, median 5,988 tokens, 63%
+    # under the 8192 span threshold. Fragments also break the task itself --
+    # facts end up separated from the summary that restates them.
+    sentences = [re.sub(r"\s+", " ", s).strip()
+                 for s in re.split(r'(?<=[.!?])\s+', raw)]
+    sentences = [s for s in sentences if 40 < len(s) < 400]
     rng = random.Random(seed)
     docs, total = [], 0
     for i in range(n_docs):
         k = rng.randint(*k_range)
-        d = make_doc(rng, sentences, k, approx_tokens, tok)
+        d = make_doc(rng, sentences, k, approx_tokens, tok,
+                     period_tokens=period_tokens, lags=lags)
         docs.append(d)
         total += len(tok(d, add_special_tokens=False).input_ids)
     with open(out_path, "w") as fh:
@@ -105,8 +141,22 @@ if __name__ == "__main__":
     ap.add_argument("--out", default=str(DATA_DIR / 'synth_recall.txt'))
     ap.add_argument("--n-docs", type=int, default=120)
     ap.add_argument("--seq", type=int, default=8192)
+    ap.add_argument("--approx-tokens", type=int, default=16000,
+                    help="target length of each synthetic document")
+    ap.add_argument("--period-tokens", type=int, default=2000)
+    ap.add_argument("--lags", default="0,1,2,3",
+                    help="restate the groups this many periods back; distance "
+                         "taught is about (lag+1) * period-tokens, so "
+                         "0,1,3,7,15 at period 2000 teaches 2k..32k")
+    ap.add_argument("--src-chars", type=int, default=8_000_000)
     a = ap.parse_args()
     tok = AutoTokenizer.from_pretrained(CKPT)
-    n, d = build_corpus(a.src, a.out, tok, n_docs=a.n_docs)
+    lags = tuple(int(x) for x in a.lags.split(","))
+    n, d = build_corpus(a.src, a.out, tok, n_docs=a.n_docs,
+                        approx_tokens=a.approx_tokens,
+                        period_tokens=a.period_tokens, lags=lags,
+                        src_chars=a.src_chars)
+    print(f"  retention distances taught: "
+          f"{', '.join(f'{(l+1)*a.period_tokens//1000}k' for l in lags)}")
     print(f"  wrote {d} documents, {n:,} tokens, mean {n//d:,} tok/doc -> {a.out}")
     print(f"  documents at least {a.seq} tokens get a sampling span")

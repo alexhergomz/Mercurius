@@ -156,6 +156,129 @@ Index arithmetic was checked and is correct (`logits[p-1 : p-1+nl]` against
 
 ---
 
+## 0.4 Perplexity and multi-item retrieval move in OPPOSITE directions (2026-09-20)
+
+Measured twice, with different mechanisms, in both directions. Neither metric
+alone can rank these arms.
+
+| arm | ppl@8192 | 6-cell EM | 6-cell NLL | best at |
+|---|---|---|---|---|
+| original | 18.285 | 97.1% | 0.207 | - |
+| allvera+data (forward KL + additive CE) | 15.962 | 65.0% | 0.243 | ppl of its generation |
+| gdn2vera (+ GDN-2) | 15.956 | 74.6% | 0.220 | - |
+| gdn2phq (+ per-head q, R untrained) | 15.887 | 75.0% | 0.214 | - |
+| phq2 (R actually trained) | **15.746** | 71.7% | 0.217 | perplexity |
+| rev2 (reverse KL + TAID + mixed CE) | 17.144 | **78.3%** | **0.213** | retrieval |
+
+rev2 has the WORST perplexity and the BEST retrieval of any converted arm. The
+mechanism was predicted before it was run: forward KL is mode-covering, which is
+the wrong pressure for a retrieval distribution that should be peaked and nearly
+deterministic; reverse KL is mode-seeking. The CE data term showed the same trade
+from the other side.
+
+Consequence for the method, not just the result: every perplexity-only conclusion
+in this project is suspect, and two were retracted the same day. The response is
+`--divergence jeffreys` (forward + w * reverse, both at full strength, verified
+exactly equal to their sum). NOT `js`: Jensen-Shannon measures each side against
+the midpoint, bounding the loss at log 2 -- measured 0.038 against Jeffreys'
+0.318, an 8x weaker signal, which is the same weak-gradient failure that sank
+rev2's perplexity.
+
+### 0.4b The 10-sample screen cannot resolve what we are now measuring
+
+GDN-2's +9.6 EM was far above the noise floor. The differences since are not.
+Between gdn2phq and phq2 the per-cell spread was 25.0 and 17.5 points on
+multivalue against 0.0 and 2.5 on multiquery, and a -3.3 point mean over 6 cells
+at n=10 is TWO samples. At 40 samples, phq2's multivalue@8192 moved 85.0% ->
+80.0%.
+
+So the variance is concentrated, and resolution should be bought where it lives:
+40 samples on multivalue only is ~26 min per arm, against ~52 for all six cells
+at the same depth.
+
+### 0.4c Four runs were invalid because a parameter never moved
+
+All four are one failure mode, and none of them announced itself:
+
+| run | mechanism | what actually happened |
+|---|---|---|
+| gdn2phq | per-head query maps | R in the dense group at 3e-5: ended 0.42% off identity, max off-diagonal 0.0017. Its +0.4 EM tested nothing. |
+| phase33 | decay-tied phase | pe_c created BEFORE freeze_base, which froze it. Trained a FIXED c for 150 steps. |
+| phase2 | decay-tied phase | "pe_c" added to freeze_base's DEFAULT, but the call site passes `also_train=also` explicitly, so the default is dead code. Fixed c again. |
+| (phq2's first launch) | per-head query maps | grouping fix landed in an `elif a.lora_lr` branch that never runs, because `if a.vera_lr` precedes it. |
+
+Two of those were fixes for the previous two. The pattern is patching a default or
+a branch that is not on the call path, then reading the metric instead of the
+parameter.
+
+**What actually works: assert the observable at startup.** train_recovery now
+refuses to run when a requested mechanism (`--decay-phase`, `--per-head-q`,
+`--gdn2`) has no trainable parameter matching it, and prints the count when it
+does. And `verify_checkpoint` at a 1e-4 tolerance catches the rest: it failed
+phase2 because the rebuild came out 0.24% BETTER than the run, the run carrying a
+fixed-phase penalty the checkpoint never recorded. At the old 0.2% tolerance that
+was a near miss.
+
+Corollary for R: at 3e-5 AdamW's displacement ceiling over 150 steps is 0.0045
+per element; at 1e-2 it is 1.5, larger than the identity diagonal R starts from,
+so it can erase the identity. 1e-3 gave 8.53% off identity with max off-diagonal
+0.292 -- and a real -0.89% perplexity gain. The mechanism works; the first test
+of it did not.
+
+---
+
+## 0.5 Synthetic retention data and on-policy distillation (2026-09-21)
+
+Both on one fixed arm: GDN-2 + fused MLA (per-head query maps) + all-VeRA, with
+the fixed objective (js, TAID on, CE-excess at beta = 1). No decay phase. All
+exact-match figures are n=40 on multivalue, the only depth that resolves
+differences of this size (0.4b).
+
+| arm | mechanism | ppl@8192 | @4096 | @8192 | @16384 | mean EM |
+|---|---|---|---|---|---|---|
+| synth | synthetic retention data, 20.6% of windows | **15.473** | **99.4%** | 87.5% | 64.4% | 83.8% |
+| jeff | jeffreys divergence | 16.916 | 95.0% | **90.0%** | **75.0%** | **86.7%** |
+| rev2 | reverse KL + TAID | 17.144 | 95.6% | 91.3% | 72.5% | 86.5% |
+| phq2 | forward KL | 15.746 | 91.3% | 80.0% | 59.4% | 76.9% |
+| onpol | on-policy 0.25, 256 generated | 15.853 | 80.6% | 60.6% | 45.6% | 62.3% |
+
+**Synthetic data is the only mechanism measured that improves BOTH axes**:
+-1.7% perplexity and +6.9 points of exact match against the same arm without it,
+and it nearly saturates 4k. Every other gain in this project traded one metric
+for the other -- reverse KL bought +9.8 EM for 7.4% perplexity, and the CE data
+term bought perplexity for retrieval.
+
+**It does not dominate the reverse-KL arms, and the reason is the corpus, not the
+mechanism.** jeff leads on the mean and on both long cells. The profiles are
+opposite: synthetic data is far stronger at short range, reverse KL degrades more
+gracefully with length. The synthetic documents cycle facts and restatements every
+~2,700 tokens, so the retention distances they teach are ~1,800-2,300 -- and the
+model learned the distance it was shown. 4k is nearly solved; 16k is its weakest
+cell. Reverse KL's mode-seeking is not distance-specific.
+
+Actionable: widen cycle_tokens so restatement distances span 4k-8k. One number in
+synth_recall.build_corpus.
+
+### 0.5b On-policy failed on an implementation choice, not on the method
+
+Worst arm measured on retrieval (62.3%) and worse perplexity than the arm without
+it. The rollouts were free continuations from ARBITRARY corpus offsets, so a
+quarter of the gradient budget trained error-recovery on generic prose containing
+no facts to retain and no restatement to produce. The exposure-bias fix never
+touched the failure mode it was meant to fix, and the retrieval distribution got
+25% less exposure.
+
+GKD as intended requires the rollout to BE a retrieval episode: on a synthetic
+document, let the student generate the restatement block and correct it against
+the teacher there. That is --on-policy anchored to the summary inside --synth-data,
+not at a random offset. Untested.
+
+The mechanism itself was verified live, so this is not a plumbing failure:
+`on-policy step: scored 256 of 8191 positions (3.1%), all of them
+student-generated`, printed by the trainer on the real run.
+
+---
+
 ## 1. Measured — headline results
 
 ### 1.1 Three-way validation (the presentable result)
@@ -765,6 +888,16 @@ two full 8192 forwards, a resume write is a 1.1 GiB overwrite.
 - **`ps -eo args | grep "[t]rain_recovery.py"` self-matches the shell.** Match on
   `comm == python`. A too-narrow process check (capped output) caused a
   GPU collision on 2026-09-12 that OOMed a launch.
+- **Never match a process by its arguments, in any form.** Not `pkill -f`, not
+  `ps | grep`, not `awk /pattern/`, not `case $args in *pattern*`. Five
+  self-inflicted shell kills on 2026-09-20, every one the same mechanism: the
+  shell running the command has the pattern in ITS own command line, because the
+  pattern appears as a literal in the very command doing the matching. The `[t]`
+  bracket trick hides the matcher, not the parent.
+  THE ONLY SAFE PROCEDURE: run `ps` in one call, READ the numeric PIDs from the
+  output, then `kill <pid>` with literal digits in a SEPARATE call. Never
+  construct the PID list and the kill in the same command.
+
 - **Never `pkill -f`, and never match on ARGS at all.** Kill by explicit numeric
   PID obtained from `ps -eo pid,comm=` with `comm == python`. Matching on args --
   including with the `[t]rain` bracket trick -- kills the shell running the
@@ -844,3 +977,216 @@ Kept deliberately: every one was stated confidently before it was checked.
 | "KDA uses scalar decay" | it uses a diagonal |
 | "val-ctrl died at step 100" | it was alive; the process check was too narrow |
 | "retrieval cost −17.32% / −30.39%" | mostly training damage from the broken objective |
+
+## 0.6 Appended data is unreachable under sequential sampling
+
+State passing trains on contiguous windows and carries the recurrent state from
+one window to the next, so the state a window starts from is the state that
+arose from the text immediately before it. The carry is dropped every
+`stride_docs` windows (64, about 524 k tokens), not at document boundaries.
+
+`sequential_batches` starts at position 0 and walks forward. With 150 steps at
+seq 8192 it covers 1.23 M tokens. The synthetic recall corpus was *appended*
+after the natural corpus, at offset 30.0 M of a 37.45 M-token stream, so the
+walk never reached it.
+
+Measured on the real corpora, 150 steps at 8192:
+
+| placement | synthetic share of trained tokens | windows containing synthetic text |
+|---|---|---|
+| appended | 0.0% | 0 / 150 |
+| interleaved | 13.0% | 29 / 150 |
+
+The log reported a 19.9% share throughout, because it reported the share of the
+STREAM, not of the tokens the sampler would visit. This is why every on-policy
+step logged "no restatement header and stayed teacher-forced": on-policy anchors
+at a restatement header, headers exist only in synthetic documents, and no
+synthetic document was ever sampled. Neither mechanism was under test.
+
+Two changes. `interleave_corpora` distributes the synthetic documents through
+the natural stream, which leaves the walk contiguous and so leaves state passing
+unchanged. And the on-policy coin is now drawn AFTER the header search rather
+than before: drawing first spent the budget on windows with nothing to retrieve,
+turning a nominal rate of 0.5 into an effective 0.0.
+
+Verified at 20 steps: `3 rollouts; 14 windows had no restatement header and 3
+eligible windows lost the draw` -- 6 of 20 windows eligible, half of those
+sampled, as specified. ppl@8192 17.370 -> 16.583.
+
+Two unrelated traps found while getting there. Without `--live-teacher` and with
+no logit cache, the loss falls to a branch that calls `kl_loss` on the full
+8192 x 248,320 logit tensor unchunked, which OOMs at 57.5 GiB. And `op_lo`, the
+index on-policy uses to restrict the loss to student-generated tokens, is only
+honoured in the live-teacher branch; the cached branch loops `range(0, L)`, so
+on-policy is silently ignored whenever a logit cache is used.
+
+## 0.7 Retrieval concentrates in trunk layers 15 and 19
+
+Why look. All six full-attention layers were compressed to the same d_c = 256.
+The retrieval-head literature says heads are not interchangeable: a small subset
+does the copying (Wu et al., arXiv:2404.15574), and RazorAttention (2407.15891)
+and DuoAttention (2410.10819) exploit that by compressing those heads less. Palu
+(2407.21118) reports per-head decomposition (M-LRD) degrades and grouped-head
+(G-LRD) is the usable form.
+
+Granularity. This model has 8 query heads but only 2 KV heads per layer, and the
+latent replaces the KV projections, so grouping inside a layer is already
+per-KV-head -- the variant Palu found degrades. The axis with room is ACROSS
+layers: six layers share 6 * 256 = 1536, split evenly today.
+
+Score: fraction of answer-token positions whose argmax attention lands inside
+the needle span, teacher-forced so the measurement is deterministic. bf16, eager
+attention, L = 4096, needles at depths 0.25/0.5/0.75.
+
+| trunk layer | mean over heads | max | whitened-spectral d_c |
+|---|---|---|---|
+| 3 | 0.219 | 0.750 | 314 |
+| 7 | 0.528 | 0.944 | 203 |
+| 11 | 0.500 | 1.000 | 204 |
+| 15 | 0.885 | 1.000 | 279 |
+| 19 | 0.826 | 1.000 | 286 |
+| 23 | 0.514 | 0.944 | 250 |
+
+Retrieval concentrates in layers 15 and 19. The spectral allocator gives the
+LARGEST share to layer 3, which retrieves least: it minimises total truncation
+error, an objective indifferent to whether a layer retrieves. So spending the
+same 1536 by retrieval score is a genuine alternative, not a reordering.
+
+### Retracted: the first allocation this produced
+
+The first run reported `retrieval {3: 693, 7: 130, 11: 121, 15: 181, 19: 225,
+23: 186}` and it is meaningless. `score_heads` keyed scores by position in
+`out.attentions` (0..5); `whitened_spectra` keys by trunk index (3, 7, 11, 15,
+19, 23). The two sets intersect in exactly one element, 3. Layer 3 therefore got
+a real weight of 1.0 and the other five fell to `floor = 0.05`, a 20x advantage
+that read as a dramatic finding. The scores were never wrong, only their keys.
+
+`allocate_ranks_retrieval` now raises `KeyError` when the score dict does not
+cover the spectra keys, instead of letting `.get(k, 0.0)` fall to the floor. A
+silent default is what made a key bug look like a measurement.
+
+## 0.8 CE excess has no teacher anchor on synthetic tokens
+
+The objective is JS + (CE(y,p_s) - CE(y,p_t)). The second term is negative
+whenever the student's cross-entropy beats the teacher's on a token.
+
+The teacher is the original Qwen3.5-0.8B and has never seen the synthetic
+restatement format. The student trains on it. So on the 20% of tokens that are
+synthetic the student beats the teacher cheaply, the CE-excess term goes
+negative, and the objective PAYS for moving away from the teacher there. Observed
+directly: total loss -0.0090 at step 25, which JS alone cannot produce since
+JS >= 0.
+
+This is not obviously wrong -- the teacher cannot do the retrieval task, so a
+student that exceeds it is the goal. But on exactly the tokens added to improve
+retrieval, the term behaves as plain task-fitting rather than distillation, and
+findings 0.4 already records a perplexity/retrieval trade.
+
+Correction: the -0.0090 above was one step, and the note as first written implied
+a persistent drift. Step 50 read +0.0698. The sign tracks how synthetic the
+current window is, since sampling is sequential and a window is either inside a
+synthetic document or not -- so the term swings per window rather than pulling
+steadily negative. The mechanism stands; its magnitude over a run does not follow
+from one reading.
+
+Test: whether ppl@8192 holds while retrieval improves. If ppl degrades as the
+loss goes further negative, the fix is to apply CE excess only off the synthetic
+spans, not to change the divergence.
+
+## 0.9 The combined run is the worst retrieval arm measured
+
+Config: GDN-2, fused MLA, all-VeRA, JS + TAID + CE excess, synthetic corpus
+teaching 2k/4k/8k/16k/32k at a 20% token share, state passing on, on-policy at
+rate 0.5 among eligible windows. 150 steps. Both mechanisms verified firing:
+17 rollouts, 118 windows with no restatement header, 15 eligible lost the draw.
+
+niah_multivalue, n = 40 per cell:
+
+| arm | ppl@8192 | 4k | 8k | 16k |
+|---|---|---|---|---|
+| synth only (0.5) | 15.473 | 99.4% | 87.5% | 64.4% |
+| on-policy, unanchored (0.5b) | - | 80.6% | 60.6% | 45.6% |
+| far corpus + on-policy + state passing | 15.726 | 70.0% | 45.0% | 32.5% |
+
+Worse at every length than both. Perplexity is essentially unchanged (15.726 vs
+15.473), so this is not the perplexity/retrieval trade of 0.4 -- there is no
+compensating gain.
+
+The prediction that a corpus spanning 2k-32k would trade short distance for long
+is FALSIFIED. 16k fell too, 64.4% -> 32.5%. Teaching more distances did not move
+capacity to the far end; it lost accuracy everywhere.
+
+Fixing on-policy's targeting did not rescue on-policy. 0.5b attributed its
+failure to rollouts being generic prose with nothing to retrieve. They are now
+anchored at restatement headers and verified student-generated, and the result is
+worse than the unanchored version, not better.
+
+Confounded, and avoidably so: three things changed at once against the 0.5 arm --
+the corpus (2k-8k -> 2k-32k), state passing (off -> on), and on-policy (off ->
+0.5). One measurement cannot attribute the damage among them. The next run drops
+on-policy alone and keeps everything else, because on-policy is the only one of
+the three already implicated by a prior measurement.
+
+NLL on the gold values barely moved (0.276 / 0.308 / 0.373) while EM fell about
+30 points. Teacher-forced NLL again fails to track free-running EM, as in 0.4b.
+
+## 0.10 Allocation screen: spectral looks better, retrieval UNRESOLVED (test was unfair)
+
+Six MLA layers share a total d_c of 1536, split evenly today. Two ways to split
+it unevenly were compared against uniform and against the uncompressed model, at
+identical total cache, on stage-AB with NO adapters so that only the allocation
+differs. niah_multivalue @4096, n = 20, shared samples.
+
+| arm | EM | NLL(values) | d_c |
+|---|---|---|---|
+| uncompressed, no MLA | 100.0% | 0.238 | - |
+| spectral (allocate_ranks) | 80.0% | 0.264 | 3:314 7:203 11:204 15:279 19:286 23:250 |
+| uniform | 65.0% | 0.284 | 256 each |
+| retrieval-weighted | 60.0% | 0.242 | 3:182 7:212 11:202 15:354 19:328 23:258 |
+
+Two results.
+
+Non-uniform allocation is worth having: spectral recovers 15 of the 35 points
+that compression costs, for free, at the same cache size. The machinery already
+exists and is not switched on.
+
+Weighting by retrieval score showed NOTHING. Retracted claim: this section first
+said retrieval-weighting "loses to uniform". In items, uniform is 13/20 and
+retrieval 12/20 -- a one-sample difference. That is noise, not a ranking.
+Spectral at 16/20 leads uniform by three samples, which is suggestive only.
+
+Worse, the screen is not a fair test of the retrieval hypothesis, for a reason
+built into its design. It evaluates with NO adapters. Pre-recovery EM is
+dominated by gross activation error, and gross activation error is exactly what
+the spectral allocator minimises -- so the comparison was run on spectral's home
+ground. Adapters exist to absorb reconstruction damage; the retrieval-aware
+hypothesis is a claim about what survives AFTER recovery, which this screen
+cannot see. "No adapters removes a confound" was the right instinct about
+adapter/latent mismatch and the wrong call overall, because it also removed the
+mechanism the hypothesis depends on.
+
+Three further defects. The weighting score * sigma^2 mixes a probability with
+squared activation error and has no principled relative scale, so it only
+re-ranks rather than expressing "protect this layer". The literature's method is
+near-binary -- RazorAttention and DuoAttention keep retrieval heads at full cache
+and compress the rest hard -- while this was a gentle reweighting that never
+approached protecting layers 15 and 19. And the score itself rests on 18 samples
+at one length on one task, with an argmax-on-needle criterion that misses heads
+contributing to retrieval without owning the argmax.
+
+Note the confound in the model: layer 3 has both the worst spectrum (0.9217) and
+the lowest retrieval (0.239), so the two objectives disagree maximally on exactly
+one layer, which is where a 20-sample screen has no power.
+
+Fair test: train one arm per allocation and compare post-recovery retrieval at
+n >= 40 over several lengths. Two arms suffice (spectral vs retrieval-weighted),
+since uniform is the current default.
+
+NLL inverts the EM ranking again: the retrieval-weighted arm has the BEST value
+NLL (0.242) and the WORST EM (60.0%). Third instance, after 0.4b and 0.9, of
+teacher-forced NLL failing to track free-running accuracy. Value NLL should not
+be used to choose between allocations.
+
+Caveat: n = 20 means one item is 5 points. Nothing here separates at better than
+three items. Confirming uniform vs spectral at n = 40 is queued. The retrieval
+arm is NOT dropped -- it was never given a test it could pass.

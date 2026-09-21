@@ -40,6 +40,11 @@ SYNTH_RECALL = DATA_DIR / "synth_recall.txt"       # multi-fact retention corpus
 MIN_FREE_GB = float(os.environ.get("MERCURIUS_MIN_FREE_GB", "8.0"))
 
 
+# NLTK (sentence splitting for the RULER haystacks) refuses a world- or
+# group-writable data directory, so keep its data private to the tree.
+os.environ.setdefault("NLTK_DATA", str(CACHE_DIR / "nltk_data"))
+
+
 def ensure_dirs():
     for d in (CKPT_DIR, CACHE_DIR, LOGS_DIR):
         d.mkdir(parents=True, exist_ok=True)

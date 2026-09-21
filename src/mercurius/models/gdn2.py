@@ -127,6 +127,6 @@ def convert_to_gdn2(model, verbose=True):
             la = getattr(layer, "linear_attn", None)
             if isinstance(la, Qwen3_5GDN2GatedDeltaNet):
                 H += (la.in_proj_be.weight.numel() + la.in_proj_bw.weight.numel())
-        print(f"  GDN-2: lifted {n} KDA layers; +{H/1e6:.2f} M gate parameters "
+        print(f"  GDN-2: lifted {n} layers from KDA to channel-wise gates; +{H/1e6:.2f} M gate parameters "
               f"(tiled from in_proj_b, exact at init)", flush=True)
     return n

@@ -20,7 +20,7 @@ Baselines this is measured against (from characterize.py, wikitext, same lengths
     tiled  C3 NoPE       : 14.278 / 21.625 / 17.385
     seeded C3 NoPE       : 14.816 / 22.088 / 16.683
 """
-import sys, os, json, time, argparse, torch
+import sys, os, json, time, argparse, random, torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from mercurius.models.kda import (load_kda_model, enable_state_passing, reset_state,
@@ -180,7 +180,8 @@ def taid_space_for(mode):
 
 
 def _chunk_div_terms(h_s_c, h_t_c, W_s, W_t, mode="forward", lam=1.0,
-                     tgt_c=None, ce_beta=1.0, ce_mix=0.0, taid_space="prob"):
+                     tgt_c=None, ce_beta=1.0, ce_mix=0.0, taid_space="prob",
+                     rev_w=1.0):
     """Per-position (divergence, data) terms, full vocabulary, in nats.
 
     Returns a (2, C) tensor: row 0 the distillation divergence, row 1 the data
@@ -269,6 +270,22 @@ def _chunk_div_terms(h_s_c, h_t_c, W_s, W_t, mode="forward", lam=1.0,
             m = torch.logaddexp(a_lp, b_lp) - LOG2
             return 0.5 * ((a_lp.exp() * (a_lp - m)).sum(-1)
                           + (b_lp.exp() * (b_lp - m)).sum(-1))
+        if mode == "jeffreys":
+            # KL(target||model) + w * KL(model||target): the symmetric KL, and
+            # the direct response to a trade measured twice on this model.
+            # Forward alone (mode-covering) gave the best perplexity and the
+            # worst multi-item retrieval; reverse plus TAID (mode-seeking) gave
+            # the worst perplexity and the best retrieval -- EM 78.3%, NLL 0.213,
+            # better than any forward arm. A peaked retrieval distribution wants
+            # mode-seeking; language modelling wants mode-covering. Carrying both
+            # terms asks for both instead of choosing.
+            #
+            # Not the same as "js": Jensen-Shannon measures each side against the
+            # MIDPOINT, which bounds the loss at log 2 and softens both
+            # pressures. Jeffreys keeps each direction at full strength. js is
+            # also implemented and has never been run.
+            return ((a_lp.exp() * (a_lp - b_lp)).sum(-1)
+                    + rev_w * (b_lp.exp() * (b_lp - a_lp)).sum(-1))
         raise ValueError(mode)
 
     return torch.stack([D(t_lp, s_lp), data])
@@ -417,6 +434,47 @@ def batches(ids, seq_len_fn, steps, seed=0, align=1, gen=None, spans=None):
         yield ids[i:i + seq_len].unsqueeze(0), False, i
 
 
+def _docs_and_spans(tok, path, min_len):
+    """Per-document token tensors plus which of them qualify for sampling."""
+    docs = [d for d in open(path).read().split("\n\n") if d.strip()]
+    out = []
+    for d in docs:
+        ids = tok(d, return_tensors="pt", add_special_tokens=False).input_ids[0]
+        out.append(ids)
+    return out
+
+
+def interleave_corpora(a_docs, b_docs, min_len):
+    """Distribute b's documents evenly through a's, then build stream + spans.
+
+    Appending instead of interleaving is silently fatal under --state-passing:
+    sequential_batches starts at position 0 and walks forward, so 150 steps at
+    8192 cover the first 1.23 M tokens of a 37.45 M stream and NEVER reach
+    documents appended at the end. Measured: every on-policy step reported "no
+    restatement header" because no window had come from a synthetic document --
+    the mix was 0%, not the 19.9% the log claimed.
+    """
+    if not b_docs:
+        merged = a_docs
+    else:
+        every = max(1, len(a_docs) // len(b_docs))
+        merged, bi = [], 0
+        for i, d in enumerate(a_docs):
+            merged.append(d)
+            if i % every == every - 1 and bi < len(b_docs):
+                merged.append(b_docs[bi]); bi += 1
+        merged.extend(b_docs[bi:])
+    chunks, spans, pos = [], [], 0
+    for ids in merged:
+        n = int(ids.numel())
+        if n >= min_len:
+            spans.append((pos, pos + n))
+        chunks.append(ids)
+        pos += n
+    import torch as _t
+    return _t.cat(chunks), spans
+
+
 def tokenize_by_document(tok, path, min_len):
     """Tokenize per document and return the stream plus per-document spans.
 
@@ -542,7 +600,23 @@ def main():
     ap.add_argument("--seq", type=int, default=2048)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--eval-every", type=int, default=150)
+    ap.add_argument("--on-policy", type=float, default=0.0, metavar="FRAC",
+                    help="fraction of steps that distil on the STUDENT's own "
+                         "generations instead of corpus text (GKD). Fixes exposure "
+                         "bias: teacher-forced training never asks the model to "
+                         "recover from its own mistake, which is what emitting "
+                         "several retrieved values in sequence requires. Reported "
+                         "to turn quadratic error accumulation into linear")
+    ap.add_argument("--on-policy-gen", type=int, default=256, metavar="N",
+                    help="tokens the student generates on an on-policy step. The "
+                         "prompt is the window minus N, so context length is "
+                         "unchanged and only N decode steps are added")
+    ap.add_argument("--rev-weight", type=float, default=1.0, metavar="W",
+                    help="weight on the reverse term of --divergence jeffreys")
     ap.add_argument("--ce-mix", type=float, default=0.0, metavar="W",
+                    # DEPRECATED. A mixing weight in [0,1] is exactly the
+                    # arbitrary coefficient the CE-excess formulation exists to
+                    # avoid. Kept at 0 only so old command lines still parse.
                     help="mix the ground truth INTO the distillation target with "
                          "weight W in [0,1]: q = (1-W)*p_teacher + W*onehot. "
                          "Unlike --ce-beta this carries the teacher term's own "
@@ -595,12 +669,9 @@ def main():
     ap.add_argument("--cache-tokens", type=int, default=1_000_000,
                     help="how many tokens to cache; guards against filling the "
                          "root filesystem, which can brick a Jetson")
-    ap.add_argument("--taid", action="store_true",
-                    help="ramp the target from the student's OWN distribution "
-                         "to the teacher's over training (Shing et al.). "
-                         "Orthogonal to --divergence: it changes WHAT the target "
-                         "is, not which divergence measures the gap. Needs --ce-mix > 0, since at lambda=0 the target is the student itself and the "
-                         "divergence sits at its minimum with zero gradient.")
+    ap.add_argument("--no-taid", dest="taid", action="store_false",
+                    help="disable the TAID target schedule (on by default)")
+    ap.set_defaults(taid=True)
     ap.add_argument("--ce-beta", type=float, default=1.0,
                     help="weight on the data term, which is expressed as EXCESS "
                          "nats over the teacher: D(y||student) - D(y||teacher), "
@@ -609,8 +680,8 @@ def main():
                          "it, so beta=1 is principled rather than a tuned "
                          "constant. 0 gives pure distillation, which caps the "
                          "student at teacher quality.")
-    ap.add_argument("--divergence", default="forward",
-                    choices=["forward", "reverse", "js"],
+    ap.add_argument("--divergence", default="js",
+                    choices=["forward", "reverse", "js", "jeffreys"],
                     help="output-loss divergence. forward KL is mode-covering "
                          "and makes an incapable student spread its mass; "
                          "reverse is mode-seeking and lets it concentrate.")
@@ -632,6 +703,11 @@ def main():
                          "4.00x KV as --mla-dc 256, but distributed to the layers "
                          "that need it: measured 5.02%% less activation error at "
                          "identical cache size. Requires --mla-covs.")
+    ap.add_argument("--mla-alloc", default=None,
+                    help="explicit per-layer d_c: a JSON dict {layer: rank} or a "
+                         "path to one (a retrieval_heads.json is accepted and its "
+                         "'retrieval' key used). Mutually exclusive with "
+                         "--mla-budget, which would recompute the allocation.")
     ap.add_argument("--mla-dc", type=int, default=None,
                     help="fixed latent dim instead of adaptive")
     ap.add_argument("--mla-covs", default=None,
@@ -817,11 +893,11 @@ def main():
                          "exhausting it freezes the machine instead of raising")
     ap.add_argument("--min-avail-gb", type=float, default=12.0,
                     help="stop cleanly if system MemAvailable falls below this")
-    ap.add_argument("--gpu-temp-pause", type=float, default=78.0)
-    ap.add_argument("--gpu-temp-resume", type=float, default=68.0)
+    ap.add_argument("--gpu-temp-pause", type=float, default=84.0)
+    ap.add_argument("--gpu-temp-resume", type=float, default=80.0)
     ap.add_argument("--acpi-temp-pause", type=float, default=90.0)
-    ap.add_argument("--acpi-temp-resume", type=float, default=80.0)
-    ap.add_argument("--eval-gpu-start", type=float, default=62.0,
+    ap.add_argument("--acpi-temp-resume", type=float, default=85.0)
+    ap.add_argument("--eval-gpu-start", type=float, default=75.0,
                     help="before each eval forward (one uninterrupted burst, "
                          "~+15C for the 27B at 8192), wait until the GPU is at "
                          "or below this")
@@ -839,6 +915,12 @@ def main():
         if a.divergence == "js":
             raise SystemExit("--taid with --divergence js is not derived; use "
                              "forward or reverse")
+        if a.divergence == "jeffreys" and a.taid_space == "auto":
+            raise SystemExit(
+                "--taid with --divergence jeffreys has no clean space: in prob "
+                "space the FORWARD term becomes a loss-scale ramp, in logit space "
+                "the REVERSE term does (taid_space_for). Name one explicitly with "
+                "--taid-space logit|prob, knowing which half TAID then acts on.")
         want = taid_space_for(a.divergence)
         if a.taid_space == "auto":
             a.taid_space = want
@@ -873,8 +955,24 @@ def main():
     # memorization instead of recovery.
     train_path = a.train_data or TRAIN_DATA
     if a.doc_aware:
-        train_ids, doc_spans = tokenize_by_document(tok, train_path, a.seq)
-        if a.synth_data:
+        if a.synth_data and a.state_passing:
+            # interleave, do not append: see interleave_corpora. Tokenise the
+            # natural corpus once, here, instead of letting the generic path
+            # below do it as well -- doing both cost ~6 min of startup.
+            _a = _docs_and_spans(tok, train_path, a.seq)
+            _b = _docs_and_spans(tok, a.synth_data, a.seq)
+            _n_syn = sum(int(x.numel()) for x in _b)
+            train_ids, doc_spans = interleave_corpora(_a, _b, a.seq)
+            print(f"  synthetic multi-item data: {len(_b)} documents interleaved "
+                  f"through {len(_a)}, {_n_syn/int(train_ids.numel()):.1%} of TOKENS "
+                  f"(sequential sampling reaches them only if interleaved)",
+                  flush=True)
+            print(f"  document-aware: {len(_a)} natural docs, "
+                  f"{sum(1 for x in _a if x.numel() >= a.seq)} at least {a.seq} tokens",
+                  flush=True)
+        else:
+            train_ids, doc_spans = tokenize_by_document(tok, train_path, a.seq)
+        if a.synth_data and not a.state_passing:
             # Appended, not substituted. batches() picks a span UNIFORMLY, so the
             # synthetic share of draws is n_synth_spans / total_spans -- not the
             # token share, which would be far smaller since these documents are
@@ -884,9 +982,22 @@ def main():
             n_nat = len(doc_spans or [])
             doc_spans = (doc_spans or []) + [(s + off, e + off) for s, e in s_spans]
             train_ids = torch.cat([train_ids, s_ids])
-            print(f"  synthetic multi-item data: {len(s_spans)} spans added to "
-                  f"{n_nat}; {len(s_spans)/max(len(doc_spans),1):.1%} of sampled "
-                  f"windows will require multi-fact retention", flush=True)
+            # Report the share that will ACTUALLY apply. With --state-passing the
+            # sampler is sequential and doc spans are never consulted, so the
+            # governing quantity is the TOKEN share, not the span share -- and the
+            # two differ by 2x here. Printing the span share under state passing
+            # would overstate the mix.
+            _tok_share = int(s_ids.numel()) / int(train_ids.numel())
+            _span_share = len(s_spans) / max(len(doc_spans), 1)
+            if a.state_passing:
+                print(f"  synthetic multi-item data: {len(s_spans)} documents, "
+                      f"{_tok_share:.1%} of TOKENS (state passing samples "
+                      f"sequentially, so doc spans do not govern the mix)",
+                      flush=True)
+            else:
+                print(f"  synthetic multi-item data: {len(s_spans)} spans added to "
+                      f"{n_nat}; {_span_share:.1%} of sampled "
+                      f"windows will require multi-fact retention", flush=True)
     else:
         train_ids = tok(open(train_path).read(), return_tensors="pt").input_ids[0]
         doc_spans = None
@@ -973,7 +1084,7 @@ def main():
 
     if a.state_passing:
         n_sp = enable_state_passing(student)
-        print(f"  state passing enabled on {n_sp} KDA layers", flush=True)
+        print(f"  state passing enabled on {n_sp} linear-attention (GDN-2) layers", flush=True)
 
     if a.grad_checkpoint:
         # Non-reentrant: with the embeddings frozen, the reentrant variant sees
@@ -1104,7 +1215,13 @@ def main():
             print("  plain SVD OVERRIDE: factorizing weight error, not "
                   "activation error -- known worse, you asked for it",
                   flush=True)
-        info = convert_to_mla(student, d_c=a.mla_dc, budget=a.mla_budget,
+        _alloc = None
+        if a.mla_alloc:
+            import json as _j, os as _o
+            _alloc = _j.load(open(a.mla_alloc)) if _o.exists(a.mla_alloc) \
+                else _j.loads(a.mla_alloc)
+            _alloc = _alloc.get("retrieval", _alloc) if isinstance(_alloc, dict) else _alloc
+        info = convert_to_mla(student, alloc=_alloc, d_c=a.mla_dc, budget=a.mla_budget,
                               energy=a.mla_energy if a.mla_energy else 0.95,
                               covs=covs)
         for l in get_trunk(student).layers:
@@ -1143,7 +1260,10 @@ def main():
         also = also + ("linear_attn.", "self_attn.")
     if a.train_norms:
         also = also + ("norm",)
+    if a.decay_phase is not None:
+        also = also + ("pe_c",)
     n_tr = freeze_base(student, also_train=also)
+
     if a.fuse_gate_lora:
         # freeze_base matches substrings and "lora_A" matches "a_lora_A", so the
         # fused factors cannot be excluded through `also`. They are inert either
@@ -1214,6 +1334,37 @@ def main():
         # accounting bug here went unnoticed.
         n_tr += sum(p.numel() for n, p in student.named_parameters()
                     if n.endswith(".R") and p.requires_grad)
+
+    # Guard, placed AFTER every mechanism is installed.
+    #
+    # Placed right after freeze_base it was a FALSE POSITIVE: per-head query
+    # maps are installed ~90 lines later, so the check ran before R existed
+    # and killed a valid run. A guard that fires on correct code is worse
+    # than no guard. Adding "pe_c" to freeze_base's DEFAULT did nothing
+    # because this call passes `also` explicitly, so the default is dead code --
+    # the same shape of mistake as fixing the parameter grouping inside an elif
+    # branch that never runs. phase33 and phase2 both trained a FIXED c for 150
+    # steps and were read as tests of a learned phase.
+    #
+    # A requested mechanism whose parameter is not trainable is a silent null
+    # result, so assert the observable instead of trusting the code to read
+    # right. Cheap, and it fails at startup rather than at analysis time.
+    for flag, needle, what in (
+            (a.decay_phase is not None, "pe_c", "--decay-phase"),
+            (a.per_head_q, ".R", "--per-head-q"),
+            (a.gdn2, "in_proj_be", "--gdn2")):
+        if not flag:
+            continue
+        live = [n for n, p in student.named_parameters()
+                if needle in n and p.requires_grad]
+        if not live:
+            raise SystemExit(
+                f"{what} was requested but no parameter matching '{needle}' is "
+                f"trainable, so the mechanism cannot move and the run would "
+                f"report a null result for an untested change. Check that the "
+                f"name is in `also` above, and that nothing froze it after.")
+        print(f"  {what}: {len(live)} trainable tensors matching '{needle}'",
+              flush=True)
 
     if a.student_bits == 4:
         # LAST structural change, after everything that reads weights: the MLA
@@ -1398,6 +1549,22 @@ def main():
     # after opt/sched, but before any evaluate(step>0) call -- evaluate(0) runs
     # earlier and short-circuits on `step > 0`, so the name is never looked up
     # then. Closures resolve at call time, not definition time.
+    _op_announced = False
+    # On-policy rollouts must BE retrieval episodes. Anchored at an arbitrary
+    # offset they were free continuations of generic prose -- no facts to retain,
+    # no restatement to produce -- and the arm came last on retrieval (62.3% vs
+    # 76.9% without it, findings 0.5b). Anchoring at the LAST restatement header
+    # inside the window makes the student generate the codes it must have
+    # retained, with the whole window as context, and corrects it there.
+    from mercurius.recovery.synth_recall import SUMMARY_HEAD
+    _op_mark = tok(" " + SUMMARY_HEAD, add_special_tokens=False).input_ids
+    _op_mark_t = torch.tensor(_op_mark)
+    _op_skipped = 0
+    _op_inelig = 0
+    _op_steps = 0
+    _bg_op = random.Random(20260920)   # on-policy coin, independent of
+                                       # the window sampler so a matched
+                                       # control sees identical windows
     _resume_ctx = {"opt": opt, "sched": sched, "gens": {"mix": _g, "batch": _bg},
                    "taid": taid}
     if a.length_mix:
@@ -1536,6 +1703,78 @@ def main():
                 student.config.use_cache = False
                 _ckpt_on[0] = want
         L = x.shape[1]
+        # ---------------------------------------------------------- on-policy
+        # GKD: on a fraction of steps, distil on what the STUDENT would actually
+        # say rather than on corpus text. The divergence is then measured on
+        # positions the student itself produced, so it learns to recover from its
+        # own errors -- the failure teacher forcing cannot present. Measured on
+        # this model: converted arms have BETTER teacher-forced likelihood than
+        # the original and far worse exact match on multi-value retrieval, which
+        # is exposure bias and nothing else.
+        op_lo = 0
+        if a.on_policy > 0.0:
+            # On-policy rollouts must BE retrieval episodes. Anchored at an
+            # arbitrary offset they were free continuations of generic prose -- no
+            # facts to retain, no restatement to produce -- and that arm came last
+            # on retrieval, 62.3% against 76.9% without it (findings 0.5b).
+            #
+            # Anchoring at the LAST restatement header in the window keeps the
+            # whole preceding context AND makes the generated tokens the values
+            # the student must have retained, so the correction lands on the
+            # failure mode. A window with no header is natural text with nothing
+            # to retrieve, and stays teacher-forced.
+            _w = x[0].cpu()
+            _hit = -1
+            if _w.numel() > _op_mark_t.numel():
+                _eq = (_w.unfold(0, _op_mark_t.numel(), 1) == _op_mark_t).all(dim=1).nonzero()
+                if _eq.numel():
+                    _hit = int(_eq[-1]) + _op_mark_t.numel()
+            # Draw AFTER establishing eligibility. Drawing first spends the
+            # budget on windows with no header: under --state-passing only ~19%
+            # of windows carry a synthetic span, so an 0.5 rate became an
+            # effective ~0.1 and, before the interleave fix, exactly 0.0.
+            if _hit < 64 or _hit >= L - 8:
+                _op_inelig += 1
+            elif _bg_op.random() >= a.on_policy:
+                _op_skipped += 1
+            else:
+                _op_steps += 1
+                plen = _hit
+                was_ckpt = getattr(student, "is_gradient_checkpointing", False)
+                if was_ckpt:
+                    student.gradient_checkpointing_disable()
+                # Suspend state passing across the rollout. During incremental
+                # decoding the recurrent state must come from the decode cache;
+                # _carry overrides it (kda_model: `if self._state_passing and
+                # self._carry is not None`), so every generated token would
+                # restart from the stale carried state and the rollout would be
+                # garbage -- silently, since it still returns tokens. The flag is
+                # all that is toggled, so _carry survives for the training
+                # forward that follows.
+                if a.state_passing:
+                    enable_state_passing(student, False)
+                student.config.use_cache = True
+                student.eval()
+                with torch.no_grad():
+                    x = student.generate(
+                        x[:, :plen], max_new_tokens=a.on_policy_gen,
+                        do_sample=True, temperature=1.0, top_p=1.0,
+                        pad_token_id=tok.eos_token_id, use_cache=True)
+                student.train()
+                student.config.use_cache = False
+                if a.state_passing:
+                    enable_state_passing(student, True)
+                if was_ckpt:
+                    student.gradient_checkpointing_enable()
+                L = x.shape[1]
+                # token at index plen is the first the student chose, so the
+                # position that PREDICTS it is plen-1
+                op_lo = plen - 1
+                if not _op_announced:
+                    print(f"  on-policy: anchored at a restatement header "
+                          f"(token {plen}), scored {L - 1 - op_lo} of {L - 1} "
+                          f"positions, all student-generated", flush=True)
+                    _op_announced = True
         s_logits = t_logits = None
         if a.live_teacher:
             # Exact full-vocabulary KL against a teacher conditioned on the
@@ -1550,12 +1789,12 @@ def main():
             # and is dropped -- 1 of 8192, and it keeps the data term defined
             nxt = x[0, 1:]
             tot, n = 0.0, 0
-            for i in range(0, L - 1, a.fullkl_chunk):
+            for i in range(op_lo, L - 1, a.fullkl_chunk):
                 j = min(i + a.fullkl_chunk, L - 1)
                 terms = checkpoint(_chunk_div_terms, h_s[i:j], h_t[i:j],
                                    W_s, W_t, a.divergence, _taid_lam,
                                    nxt[i:j], a.ce_beta, a.ce_mix, a.taid_space,
-                                   use_reentrant=False)
+                                   a.rev_weight, use_reentrant=False)
                 tot = tot + terms.sum(-1)
                 n += j - i
             div_term, data_term = tot[0] / max(n, 1), tot[1] / max(n, 1)
@@ -1689,6 +1928,10 @@ def main():
               f"({(a1['ppl']-a0['ppl'])/a0['ppl']*100:+.2f}%) | "
               f"top1 {a0['top1']:.2f} -> {a1['top1']:.2f}%")
     print(f"  tokens seen: {seen / 1e6:.2f} M")
+    if a.on_policy > 0.0:
+        print(f"  on-policy: {_op_steps} rollouts; {_op_inelig} windows had no "
+              f"restatement header (natural text, nothing to retrieve) and "
+              f"{_op_skipped} eligible windows lost the draw")
     if _best["step"] >= 0:
         fin = hist["eval"][-1][8192]["ppl"]
         gap = (fin / _best["ppl"] - 1) * 100
