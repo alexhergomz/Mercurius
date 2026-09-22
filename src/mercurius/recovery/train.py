@@ -239,6 +239,16 @@ def _chunk_div_terms(h_s_c, h_t_c, W_s, W_t, mode="forward", lam=1.0,
     lg_s = (h_s_c @ W_s.T).float()
     s_lp = F.log_softmax(lg_s, -1)
     del lg_s
+    return _terms_from_logprobs(s_lp, t_lp, tgt_c, mode, lam, ce_beta, ce_mix,
+                                taid_space, rev_w)
+
+
+def _terms_from_logprobs(s_lp, t_lp, tgt_c, mode="forward", lam=1.0,
+                         ce_beta=1.0, ce_mix=0.0, taid_space="prob", rev_w=1.0):
+    """The (divergence, data) terms of _chunk_div_terms, from log-probs.
+
+    Split out so the batched MTP path (_chunk_mtp_terms) computes exactly the
+    same per-row objective from logits it formed more cheaply."""
     data = torch.zeros(s_lp.shape[0], device=s_lp.device, dtype=s_lp.dtype)
     if ce_beta != 0.0 and tgt_c is not None:
         idx = tgt_c.view(-1, 1).long()
@@ -331,6 +341,45 @@ class TAIDSchedule:
 
     def load_state_dict(self, d):
         self.t, self.m, self.prev = d["t"], d["m"], d["prev"]
+
+
+def _chunk_mtp_terms(h_s_c, z_c, h_t_ext, W_s, W_t, tgt_ext, n_rows,
+                     mode="forward", lam=1.0, ce_beta=1.0, ce_mix=0.0,
+                     taid_space="prob", rev_w=1.0):
+    """Main loss AND every MTP head for one chunk, sharing the vocab work.
+
+    h_s_c    (C, d_s)      student states at positions p = i .. i+C-1
+    z_c      (C, K, d_s)   MTP head outputs at the same positions
+    h_t_ext  (C+K', d_t)   teacher states at p = i .. i+C+K'-1 (K' <= K, cut at
+                           the sequence end)
+    tgt_ext  (C+K',)       tokens at p+1: row r predicts tgt_ext[r]
+    n_rows   (K+1,) ints   valid rows per offset j (the end of the sequence
+                           removes targets for the far heads)
+
+    Offset j (0 = the trunk's t+1, j >= 1 = head j predicting t+1+j) at
+    position p is distilled against the TEACHER'S row p+j: its own next-token
+    prediction for the same token. So one teacher log-softmax over C+K' rows
+    serves all K+1 offsets, instead of recomputing (K+1) C rows, and the
+    student's (K+1) C rows go through ONE GEMM against W_s. The per-row
+    objective is _terms_from_logprobs, i.e. exactly what _chunk_div_terms
+    computes; test_mtp_batched.py checks the two agree.
+
+    Returns (2, K+1, C): [divergence, data] per offset and row, zero where a
+    row has no target.
+    """
+    C, K, d = z_c.shape
+    t_lp = F.log_softmax((h_t_ext @ W_t.T).float(), -1)
+    S = torch.cat([h_s_c.unsqueeze(1), z_c], dim=1).reshape(C * (K + 1), d)
+    s_lp = F.log_softmax((S @ W_s.T).float(), -1).view(C, K + 1, -1)
+    out = torch.zeros(2, K + 1, C, device=s_lp.device, dtype=s_lp.dtype)
+    for j in range(K + 1):
+        n = int(n_rows[j])
+        if n <= 0:
+            continue
+        out[:, j, :n] = _terms_from_logprobs(
+            s_lp[:n, j], t_lp[j:j + n], tgt_ext[j:j + n], mode, lam, ce_beta,
+            ce_mix, taid_space, rev_w)
+    return out
 
 
 def _chunk_fullkl_terms(h_s_c, h_t_c, W_lm):
@@ -1822,14 +1871,37 @@ def main():
             # and is dropped -- 1 of 8192, and it keeps the data term defined
             nxt = x[0, 1:]
             tot, n = 0.0, 0
-            for i in range(op_lo, L - 1, a.fullkl_chunk):
-                j = min(i + a.fullkl_chunk, L - 1)
-                terms = checkpoint(_chunk_div_terms, h_s[i:j], h_t[i:j],
-                                   W_s, W_t, a.divergence, _taid_lam,
-                                   nxt[i:j], a.ce_beta, a.ce_mix, a.taid_space,
-                                   a.rev_weight, use_reentrant=False)
-                tot = tot + terms.sum(-1)
-                n += j - i
+            if a.mtp:
+                # Main loss and all MTP heads together (_chunk_mtp_terms): the
+                # teacher's log-softmax is formed once per chunk for every
+                # offset, and the student's K+1 row sets go through one GEMM.
+                z = student.mtp_head(h_s.unsqueeze(0))[0]      # (T, K, d)
+                m_tot, m_n = 0.0, 0
+                for i in range(op_lo, L - 1, a.fullkl_chunk):
+                    j = min(i + a.fullkl_chunk, L - 1)
+                    te = min(j + a.mtp, L - 1)          # teacher rows needed
+                    n_rows = torch.tensor([max(0, min(j, L - 1 - o) - i)
+                                           for o in range(a.mtp + 1)])
+                    terms = checkpoint(_chunk_mtp_terms, h_s[i:j], z[i:j],
+                                       h_t[i:te], W_s, W_t, nxt[i:te], n_rows,
+                                       a.divergence, _taid_lam, a.ce_beta,
+                                       a.ce_mix, a.taid_space, a.rev_weight,
+                                       use_reentrant=False)
+                    tot = tot + terms[:, 0].sum(-1)
+                    n += j - i
+                    m_tot = m_tot + (terms[0, 1:] + a.ce_beta * terms[1, 1:]).sum()
+                    m_n += int(n_rows[1:].sum())
+                mtp_loss = m_tot / max(m_n, 1)
+                del z
+            else:
+                for i in range(op_lo, L - 1, a.fullkl_chunk):
+                    j = min(i + a.fullkl_chunk, L - 1)
+                    terms = checkpoint(_chunk_div_terms, h_s[i:j], h_t[i:j],
+                                       W_s, W_t, a.divergence, _taid_lam,
+                                       nxt[i:j], a.ce_beta, a.ce_mix, a.taid_space,
+                                       a.rev_weight, use_reentrant=False)
+                    tot = tot + terms.sum(-1)
+                    n += j - i
             div_term, data_term = tot[0] / max(n, 1), tot[1] / max(n, 1)
             loss = div_term + a.ce_beta * data_term
             hist["div"].append(div_term.item())
@@ -1838,30 +1910,8 @@ def main():
             if taid is not None:
                 taid.update(step, div_term.item())
             if a.mtp:
-                # Head j (1..K) at position p predicts token p+1+j. Its target
-                # is the teacher's distribution at p+j -- the teacher's own
-                # next-token prediction for that same token, from more context
-                # -- so the targets are free. Same divergence, TAID coefficient
-                # and excess-CE data term as the main loss; positions scored by
-                # the main loss's own range (on-policy windows included).
-                z = student.mtp_head(h_s.unsqueeze(0))[0]      # (T, K, d)
-                m_tot, m_n = 0.0, 0
-                for j in range(1, a.mtp + 1):
-                    hi = L - 1 - j                    # last p with a target
-                    for i in range(op_lo, hi, a.fullkl_chunk):
-                        jj = min(i + a.fullkl_chunk, hi)
-                        tm = checkpoint(_chunk_div_terms, z[i:jj, j - 1],
-                                        h_t[i + j:jj + j], W_s, W_t,
-                                        a.divergence, _taid_lam,
-                                        x[0, i + 1 + j:jj + 1 + j], a.ce_beta,
-                                        a.ce_mix, a.taid_space, a.rev_weight,
-                                        use_reentrant=False)
-                        m_tot = m_tot + (tm[0] + a.ce_beta * tm[1]).sum()
-                        m_n += jj - i
-                mtp_loss = m_tot / max(m_n, 1)
                 loss = loss + a.mtp_weight * mtp_loss
                 hist.setdefault("mtp", []).append(mtp_loss.item())
-                del z
             del h_t
         elif cache is not None:
             # cached path: no teacher forward, and KL restricted to the
