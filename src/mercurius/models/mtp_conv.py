@@ -19,13 +19,15 @@ ARCHITECTURE. A temporal convolutional stack with gated residual blocks:
     for dilation D in (1, 2, 4):
         v = DWConv(x, k=3, dilation=D)             d*3
         g = DWConv(x, k=3, dilation=D)             d*3
-        x = x + v * xatlu(g; alpha_D)              1   (trainable per block)
+        x = x + v * gate(g; alpha_D)               1   (trainable per block)
     delta = DWConv(x, d -> K*d, k=1, groups=d)     K*d
     z_j   = (h + delta_j) * (1 + g_j)              K*d
     logits_j = lm_head(z_j)          predicts t+1+j, j = 1..K
 
-Receptive field 1 + 2*(1+2+4) = 15 positions. At d=1024, K=4: 26,627
-parameters against the built-in head's 20.45 M -- 768x smaller.
+    gate(g) = sigmoid(g) * (1 + 2 alpha) - alpha,  in (-alpha, 1 + alpha)
+
+Receptive field 1 + 2*(1+2+4) = 15 positions. About 26 d + 7 d parameters:
+66,563 at the 4B's d = 2560 and K = 4.
 
 WHY GATED, NOT A PLAIN CONV. A plain conv applies the same filter everywhere.
 Gating makes the contribution content-dependent, which is the selectivity that
@@ -34,17 +36,13 @@ models work at all. Over a 15-position horizon that is enough; this head is not
 trying to replace attention, only to read the trajectory the trunk already
 computed.
 
-WHY xATLU. Huang, "Expanded Gating Ranges Improve Activation Functions",
-arXiv:2405.20768. arctan as the gate gives a monotonically increasing first
-derivative, and a trainable alpha per block expands the gate's range from (0,1)
-to (-alpha, 1+alpha):
-
-    gate(x)  = arctan(x)/pi + 0.5                  in (0, 1)
-    xatlu(x) = x * (gate(x) * (1 + 2*alpha) - alpha)
-
-The paper's own conclusion is that expanded gating ranges improve first-order
-GLUs specifically, which is the block used here. alpha starts at 0, so the head
-begins as a standard ATLU gate and widens only if training asks it to.
+WHY A BOUNDED GATE (and not xATLU, which this head first used). xATLU is an
+activation, g * gate(g), so value * xatlu(gate) is QUADRATIC in the input and
+three blocks compound it to degree 8. On the 4B's real hidden states that took
+the internal scale 70 -> 2.7e8 and the first optimizer step blew the MTP loss
+up to 6,223 nats (see GatedTCNBlock). A sigmoid gate is bounded, so each block
+is at most linear in x and the head needs no normalisation. alpha keeps the
+expanded gating range of arXiv:2405.20768; it starts at 0 (plain sigmoid).
 
 IDENTITY AT INIT, TWO WAYS.
 
@@ -88,29 +86,44 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class XATLU(nn.Module):
-    """x * (arctan(x)/pi + 0.5) with a trainable expanded gating range."""
+class ExpandedSigmoid(nn.Module):
+    """Bounded GLU gate with a trainable expanded range:
+
+        gate(g) = sigmoid(g) * (1 + 2 alpha) - alpha      in (-alpha, 1 + alpha)
+
+    alpha = 0 is the plain sigmoid gate of Dauphin et al.'s gated conv. Keeps
+    the expanded-range idea of arXiv:2405.20768 without its x * gate(x) form.
+    """
 
     def __init__(self):
         super().__init__()
-        self.alpha = nn.Parameter(torch.zeros(1))     # 0 -> plain ATLU
+        self.alpha = nn.Parameter(torch.zeros(1))     # 0 -> plain sigmoid
 
-    def forward(self, x):
-        xf = x.float()
-        gate = torch.atan(xf) / math.pi + 0.5
+    def forward(self, g):
         a = self.alpha.float()
-        return (xf * (gate * (1.0 + 2.0 * a) - a)).to(x.dtype)
+        return (torch.sigmoid(g.float()) * (1.0 + 2.0 * a) - a).to(g.dtype)
 
 
 class GatedTCNBlock(nn.Module):
-    """Causal depthwise GLU block. Residual, so a zero value path is identity."""
+    """Causal depthwise GLU block: x + value(x) * gate(gate_conv(x)).
+
+    THE GATE MUST BE BOUNDED. The first version used xATLU, an ACTIVATION of
+    the form g * gate(g), so value(x) * xatlu(gate(x)) contained
+    value(x) * gate(x): quadratic in x. Three blocks in series were a degree-8
+    polynomial of h, and on the 4B's post-norm states (rms 3.1, three channels
+    near 70) the internal scale went 70 -> 884 -> 8.0e4 -> 2.7e8. The zero-init
+    output hid it at step 0; one 1e-3 Adam step moved the head's output by
+    2.7e5 and the MTP loss went 10 -> 6,223 nats, damaging the trunk through the
+    shared gradient. With a bounded gate each block is at most linear in x, as
+    the decode head is, and no normalisation is needed.
+    """
 
     def __init__(self, d, kernel=3, dilation=1):
         super().__init__()
         self.pad = (kernel - 1) * dilation
         self.value = nn.Conv1d(d, d, kernel, dilation=dilation, groups=d, bias=False)
         self.gate = nn.Conv1d(d, d, kernel, dilation=dilation, groups=d, bias=False)
-        self.act = XATLU()
+        self.act = ExpandedSigmoid()
 
     def forward(self, x):                              # (B, d, T)
         xp = F.pad(x, (self.pad, 0))                   # causal

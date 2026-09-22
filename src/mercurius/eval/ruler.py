@@ -99,7 +99,12 @@ def score_sample(model, tok, s, gen_tokens):
         # separators is ~40, so a 24-token cap reported EM 0.00% on
         # niah_single_3 while the teacher-forced NLL was 0.064. Slack of 16
         # covers a short preamble before the answer.
-        gen_tokens = len(gold_ids) + 16
+        #
+        # Floored at RULER's own 128. gold+16 alone capped niah_multiquery EM
+        # at ~75% for EVERY arm, originals included: the gold string is the
+        # four values, but models answer "- key: value" per line, so the keys
+        # consumed the budget and the 4th value was cut mid-number.
+        gen_tokens = max(128, len(gold_ids) + 16)
     pi = torch.tensor([prompt_ids], device="cuda")
     out = model(input_ids=pi, use_cache=True, logits_to_keep=1)
     first = out.logits[0, -1].float()                 # predicts gold[0]

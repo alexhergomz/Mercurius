@@ -246,6 +246,16 @@ def build(adapters, dc, covs_path, double_adapter=False, init_adapters=None,
         install_per_head_q(m, verbose=False)
         print("    replayed per-head query maps", flush=True)
 
+    # Conv MTP head, if the run had one. It never touches the t+1 prediction,
+    # so evaluation is unaffected either way; rebuilt so its tensors load
+    # instead of being reported as having no home.
+    mtp_k = [k for k in sd if k.startswith("mtp_head.gain")]
+    if mtp_k:
+        from mercurius.models.mtp_conv import ConvMTPHead
+        K, d = sd[mtp_k[0]].shape
+        m.mtp_head = ConvMTPHead(d_model=d, k=K)
+        print(f"    rebuilt conv MTP head (K={K})", flush=True)
+
     # Honour the dtype the run used. The trainer promotes trainable norm gains to
     # fp32 (bf16 cannot hold them: zero-centered RMSNorm parks the two big groups
     # at exactly 0.0 and the three norms Stage A skipped overshoot), so 79 of

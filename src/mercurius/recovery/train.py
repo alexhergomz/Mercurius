@@ -886,6 +886,19 @@ def main():
     ap.add_argument("--taid-beta", type=float, default=0.99)
     ap.add_argument("--taid-linear", action="store_true",
                     help="linear t_start -> t_end, no adaptive term")
+    ap.add_argument("--mtp", type=int, default=0, metavar="K",
+                    help="conv multi-token-prediction head (models/mtp_conv.py) "
+                         "predicting t+2..t+K+1 from the final hidden states; 0 = "
+                         "off. The trunk's own lm_head keeps t+1 untouched. Head j "
+                         "is distilled against the teacher's logits at t+j, which "
+                         "the main loss already computes.")
+    ap.add_argument("--mtp-weight", type=float, default=0.1,
+                    help="weight on the MTP loss (mean over heads)")
+    ap.add_argument("--mtp-lr", type=float, default=1e-3,
+                    help="own LR group for the head. At init z_j = h exactly, so "
+                         "until its zero-init output projection opens, the MTP "
+                         "loss asks the TRUNK to predict t+2.. with the t+1 head; "
+                         "at the dense 3e-5 that would last most of a run")
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--mem-cap-gb", type=float, default=56.0,
                     help="hard cap on this process's CUDA allocator. Unified "
@@ -1335,6 +1348,18 @@ def main():
         n_tr += sum(p.numel() for n, p in student.named_parameters()
                     if n.endswith(".R") and p.requires_grad)
 
+    if a.mtp:
+        from mercurius.models.mtp_conv import ConvMTPHead
+        _cfg = getattr(student.config, "text_config", student.config)
+        student.mtp_head = ConvMTPHead(d_model=_cfg.hidden_size, k=a.mtp)
+        for prm in student.mtp_head.parameters():
+            prm.requires_grad_(True)
+        _nm = student.mtp_head.n_params()
+        n_tr += _nm
+        print(f"  conv MTP head: K={a.mtp} (t+2..t+{a.mtp + 1}), {_nm:,} params, "
+              f"receptive field {student.mtp_head.receptive_field}, identity at "
+              f"init; weight {a.mtp_weight:g}, lr {a.mtp_lr:g}", flush=True)
+
     # Guard, placed AFTER every mechanism is installed.
     #
     # Placed right after freeze_base it was a FALSE POSITIVE: per-head query
@@ -1352,7 +1377,8 @@ def main():
     for flag, needle, what in (
             (a.decay_phase is not None, "pe_c", "--decay-phase"),
             (a.per_head_q, ".R", "--per-head-q"),
-            (a.gdn2, "in_proj_be", "--gdn2")):
+            (a.gdn2, "in_proj_be", "--gdn2"),
+            (bool(a.mtp), "mtp_head.", "--mtp")):
         if not flag:
             continue
         live = [n for n, p in student.named_parameters()
@@ -1408,13 +1434,20 @@ def main():
         # 1e-3 gives a ceiling of 0.15: enough for off-diagonals of order
         # 0.01-0.1, which separates the heads without destroying the query.
         rp = [p for n, p in student.named_parameters() if p.requires_grad and _is_r(n)]
+        _is_m = lambda n: n.startswith("mtp_head.")
+        mp = [p for n, p in student.named_parameters() if p.requires_grad and _is_m(n)]
         dp = [p for n, p in student.named_parameters()
-              if p.requires_grad and not _is_v(n) and not _is_r(n)]
+              if p.requires_grad and not _is_v(n) and not _is_r(n) and not _is_m(n)]
         groups = [{"params": dp, "lr": a.lr}, {"params": vp, "lr": a.vera_lr}]
         max_lr = [a.lr, a.vera_lr]
         if rp:
             groups.append({"params": rp, "lr": a.phq_lr})
             max_lr.append(a.phq_lr)
+        if mp:
+            groups.append({"params": mp, "lr": a.mtp_lr})
+            max_lr.append(a.mtp_lr)
+            print(f"  MTP head group: {sum(p.numel() for p in mp):,} params "
+                  f"@ {a.mtp_lr:g}", flush=True)
         print(f"  {2 + (1 if rp else 0)} groups: {sum(p.numel() for p in dp)/1e6:.2f} M dense "
               f"@ {a.lr:g}, {sum(p.numel() for p in vp)/1e6:.3f} M VeRA "
               f"@ {a.vera_lr:g}"
@@ -1804,6 +1837,31 @@ def main():
             hist["taid_t"].append(_taid_lam)
             if taid is not None:
                 taid.update(step, div_term.item())
+            if a.mtp:
+                # Head j (1..K) at position p predicts token p+1+j. Its target
+                # is the teacher's distribution at p+j -- the teacher's own
+                # next-token prediction for that same token, from more context
+                # -- so the targets are free. Same divergence, TAID coefficient
+                # and excess-CE data term as the main loss; positions scored by
+                # the main loss's own range (on-policy windows included).
+                z = student.mtp_head(h_s.unsqueeze(0))[0]      # (T, K, d)
+                m_tot, m_n = 0.0, 0
+                for j in range(1, a.mtp + 1):
+                    hi = L - 1 - j                    # last p with a target
+                    for i in range(op_lo, hi, a.fullkl_chunk):
+                        jj = min(i + a.fullkl_chunk, hi)
+                        tm = checkpoint(_chunk_div_terms, z[i:jj, j - 1],
+                                        h_t[i + j:jj + j], W_s, W_t,
+                                        a.divergence, _taid_lam,
+                                        x[0, i + 1 + j:jj + 1 + j], a.ce_beta,
+                                        a.ce_mix, a.taid_space, a.rev_weight,
+                                        use_reentrant=False)
+                        m_tot = m_tot + (tm[0] + a.ce_beta * tm[1]).sum()
+                        m_n += jj - i
+                mtp_loss = m_tot / max(m_n, 1)
+                loss = loss + a.mtp_weight * mtp_loss
+                hist.setdefault("mtp", []).append(mtp_loss.item())
+                del z
             del h_t
         elif cache is not None:
             # cached path: no teacher forward, and KL restricted to the
@@ -1895,6 +1953,8 @@ def main():
             extra = (f"  div {hist['div'][-1]:.4f}  data(excess CE) "
                      f"{hist['data'][-1]:+.4f}  taid t {_taid_lam:.3f}"
                      if hist["div"] else "")
+            if hist.get("mtp"):
+                extra += f"  mtp {hist['mtp'][-1]:.4f}"
             _g, _a = guard.temps()
             print(f"  step {step:>4}/{a.steps}  loss {loss.item():8.4f}{extra}  "
                   f"{tok_s:6.1f} tok/s  {el/60:5.1f} min  | paced "

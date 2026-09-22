@@ -11,7 +11,11 @@ cd "$(dirname "$0")/.."
 export PATH=$PWD/.venv/bin:$PATH
 "$@" > "$LOG" 2>&1 &
 PID=$!
-jobs_running() { pgrep -f '^(\.venv/bin/)?python3? (-m mercurius|scripts/thermal_bench)' | wc -l; }
+# GPU jobs only. The pattern used to be any `python -m mercurius...`, which
+# counted CPU-only tools too: building the synthetic corpus
+# (mercurius.recovery.synth_recall) read as a second GPU job and killed a
+# training run at startup on 2026-09-21.
+jobs_running() { pgrep -f '^(\.venv/bin/)?python3? (-m mercurius\.(recovery\.train|eval\.)|scripts/thermal_bench)' | wc -l; }
 while kill -0 $PID 2>/dev/null; do
   av=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
   q=$(timeout 10 nvidia-smi --query-gpu=temperature.gpu,power.draw,clocks.sm,utilization.gpu \
