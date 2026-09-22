@@ -180,6 +180,69 @@ def allocate_ranks_retrieval(spectra, lscores, total_budget, min_r=64, floor=0.0
     return ranks
 
 
+def group_by_retrieval(kv_scores, n_kv, threshold):
+    """Per layer, split KV heads into [retrieval heads, the rest] by score.
+
+    kv_scores: {(layer, kv_head): score}. A layer whose heads all fall on one
+    side gets a single group. Returns {layer: [heads, ...]}, retrieval first.
+    """
+    out = {}
+    for li in sorted({l for l, _ in kv_scores}):
+        r = [g for g in range(n_kv) if kv_scores[(li, g)] >= threshold]
+        o = [g for g in range(n_kv) if kv_scores[(li, g)] < threshold]
+        out[li] = [x for x in (r, o) if x]
+    return out
+
+
+@torch.no_grad()
+def group_spectra(model, covs, grouping, head_dim):
+    """Whitened singular values of each group's own [K; V] rows -- what
+    LatentKV._init_grouped truncates, so allocation and factorisation agree."""
+    import math
+    from mercurius.surgery.norm_fusion import get_trunk
+    from mercurius.surgery.transmla import merged_weight, whiten_factor
+    out = {}
+    for li, groups in grouping.items():
+        sa = get_trunk(model).layers[li].self_attn
+        Wk, _ = merged_weight(sa.k_proj)
+        Wv, _ = merged_weight(sa.v_proj)
+        sk = Wk.norm() / math.sqrt(Wk.numel()); sv = Wv.norm() / math.sqrt(Wv.numel())
+        gm = (sk * sv).sqrt()
+        L = whiten_factor(covs[li].to(torch.float32).to(Wk.device))
+        for gi, heads in enumerate(groups):
+            rows = torch.cat([torch.arange(h * head_dim, (h + 1) * head_dim)
+                              for h in heads]).to(Wk.device)
+            W = torch.cat([Wk[rows] * (gm / sk), Wv[rows] * (gm / sv)], 0)
+            out[(li, gi)] = torch.linalg.svdvals(W @ L)
+    return out
+
+
+def allocate_group_ranks(spectra, total_budget, weights=None, min_r=16):
+    """Water-filling over (layer, group) units: each extra rank goes where
+    weight * next-singular-value^2 is largest. weights=None is the pure
+    spectral objective (minimum total whitened truncation error); retrieval
+    weights spend more of the same budget on retrieval groups."""
+    import heapq
+    w = {k: (1.0 if weights is None else float(weights[k])) for k in spectra}
+    ranks = {k: min(min_r, spectra[k].numel()) for k in spectra}
+    used = sum(ranks.values())
+
+    def prio(k):
+        S2 = spectra[k].pow(2)
+        return -1.0 if ranks[k] >= S2.numel() else w[k] * float(S2[ranks[k]])
+
+    heap = [(-prio(k), k) for k in spectra]
+    heapq.heapify(heap)
+    while used < total_budget and heap:
+        negp, k = heapq.heappop(heap)
+        if -negp <= 0:
+            continue
+        ranks[k] += 1
+        used += 1
+        heapq.heappush(heap, (-prio(k), k))
+    return ranks
+
+
 if __name__ == "__main__":
     import argparse, sys, re as _re
     from transformers import AutoTokenizer

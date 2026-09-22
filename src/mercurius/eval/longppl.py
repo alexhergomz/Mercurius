@@ -98,6 +98,8 @@ def main():
     ap.add_argument("--books", type=int, default=4)
     ap.add_argument("--dc", type=int, default=512)
     ap.add_argument("--covs", default=str(CACHE_DIR / "kv_covs_4b.pt"))
+    ap.add_argument("--mla-groups", default=None,
+                    help="grouped-latent spec the checkpoint was trained with")
     ap.add_argument("--quantize", action="store_true")
     ap.add_argument("--mem-cap-gb", type=float, default=90.0)
     ap.add_argument("--out", default=str(LOGS_DIR / "longppl.json"))
@@ -117,7 +119,8 @@ def main():
         tag, path = spec.split("=", 1)
         m = (build_original() if path == "ORIGINAL"
              else build_original_nf4() if path == "ORIGINAL_NF4"
-             else build(path, a.dc, a.covs, quantize=a.quantize))
+             else build(path, a.dc, a.covs, quantize=a.quantize,
+                        groups=a.mla_groups))
         pacer.attach(m)
         per_book = []
         for bi, ids in enumerate(seqs):

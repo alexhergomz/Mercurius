@@ -757,6 +757,11 @@ def main():
                          "path to one (a retrieval_heads.json is accepted and its "
                          "'retrieval' key used). Mutually exclusive with "
                          "--mla-budget, which would recompute the allocation.")
+    ap.add_argument("--mla-groups", default=None, metavar="JSON",
+                    help="grouped latents: {layer: [[kv_heads, rank], ...]} per "
+                         "layer (experiments/grouped_screen.py). One latent per "
+                         "group of KV heads; overrides --mla-dc / --mla-budget. "
+                         "Needs --mla-covs.")
     ap.add_argument("--mla-dc", type=int, default=None,
                     help="fixed latent dim instead of adaptive")
     ap.add_argument("--mla-covs", default=None,
@@ -935,6 +940,12 @@ def main():
     ap.add_argument("--taid-beta", type=float, default=0.99)
     ap.add_argument("--taid-linear", action="store_true",
                     help="linear t_start -> t_end, no adaptive term")
+    ap.add_argument("--scalenorm", action="store_true",
+                    help="stage A': replace every FOLDED RMSNorm with ScaleNorm, "
+                         "one learned scalar each (64 parameters instead of "
+                         "163,840). Bitwise exact at init -- stage A already left "
+                         "those gains at 1. Unfoldable norms (model.norm, "
+                         "q/k_norm, linear_attn.norm) stay per-channel.")
     ap.add_argument("--mtp", type=int, default=0, metavar="K",
                     help="conv multi-token-prediction head (models/mtp_conv.py) "
                          "predicting t+2..t+K+1 from the final hidden states; 0 = "
@@ -1133,6 +1144,11 @@ def main():
         # already-adapted model would throw or silently drop the adapter.
         from mercurius.models.gdn2 import convert_to_gdn2
         convert_to_gdn2(student)
+    if a.scalenorm:
+        # after the GDN-2 lift, before adapters and the MLA conversion: it only
+        # swaps norm modules, so nothing downstream sees a different structure
+        from mercurius.surgery.scalenorm import convert_to_scalenorm
+        convert_to_scalenorm(student)
     if a.decay_phase is not None:
         from mercurius.models.kda import Qwen3_5KDAGatedDeltaNet as _KDA
         _n = 0
@@ -1259,7 +1275,8 @@ def main():
         print(f"  swapped {n_un} FFN adapters from LoRA to VeRA", flush=True)
 
     mla_latents = []
-    if a.mla_energy is not None or a.mla_dc is not None or a.mla_budget is not None:
+    if (a.mla_energy is not None or a.mla_dc is not None or a.mla_budget is not None
+            or a.mla_groups):
         covs = None
         if a.mla_covs:
             _c = torch.load(a.mla_covs, map_location="cpu")
@@ -1283,9 +1300,16 @@ def main():
             _alloc = _j.load(open(a.mla_alloc)) if _o.exists(a.mla_alloc) \
                 else _j.loads(a.mla_alloc)
             _alloc = _alloc.get("retrieval", _alloc) if isinstance(_alloc, dict) else _alloc
+        _groups = None
+        if a.mla_groups:
+            _gj = json.load(open(a.mla_groups))["groups"]
+            _groups = {int(l): [(list(h), int(r)) for h, r in g] for l, g in _gj.items()}
+            print(f"  grouped latents from {a.mla_groups.split('/')[-1]}: "
+                  f"{ {l: [r for _, r in g] for l, g in _groups.items()} } "
+                  f"(total {sum(r for g in _groups.values() for _, r in g)})", flush=True)
         info = convert_to_mla(student, alloc=_alloc, d_c=a.mla_dc, budget=a.mla_budget,
                               energy=a.mla_energy if a.mla_energy else 0.95,
-                              covs=covs)
+                              covs=covs, groups=_groups)
         for l in get_trunk(student).layers:
             sa = getattr(l, "self_attn", None)
             if sa is not None and hasattr(sa.k_proj, "latent"):
@@ -1427,7 +1451,8 @@ def main():
             (a.decay_phase is not None, "pe_c", "--decay-phase"),
             (a.per_head_q, ".R", "--per-head-q"),
             (a.gdn2, "in_proj_be", "--gdn2"),
-            (bool(a.mtp), "mtp_head.", "--mtp")):
+            (bool(a.mtp), "mtp_head.", "--mtp"),
+            (a.scalenorm and a.train_norms, "layernorm.weight", "--scalenorm")):
         if not flag:
             continue
         live = [n for n, p in student.named_parameters()

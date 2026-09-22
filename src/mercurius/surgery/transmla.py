@@ -88,7 +88,9 @@ class LatentKV(nn.Module):
         return torch.block_diag(*blocks)              # (n_kv*hd, n_kv*hd)
 
     def __init__(self, k_proj, v_proj, d_c, balance=True, blend=False,
-                 cov=None, v_metric=None):
+                 cov=None, v_metric=None, groups=None, head_dim=None):
+        """groups: None for one joint latent over all KV heads, or a list of
+        (kv_head_indices, rank) -- see _init_grouped."""
         super().__init__()
         Wk, k_ref = merged_weight(k_proj)        # (n_kv*hd, d_model)
         Wv, v_ref = merged_weight(v_proj)
@@ -129,6 +131,16 @@ class LatentKV(nn.Module):
             Wv_w = Wv * self.v_scale
         W = torch.cat([Wk * self.k_scale, Wv_w], dim=0)
 
+        self.groups = None
+        if groups is not None:
+            if self.v_mat:
+                raise ValueError("grouped latents do not implement v_metric")
+            if cov is None:
+                raise ValueError("grouped latents need CARE covariances")
+            self._init_grouped(Wk, Wv, cov, groups, head_dim, k_ref, d_model)
+            self._finish_init(k_proj, v_proj, blend)
+            return
+
         if cov is not None:
             # --- CARE / SVD-LLM: factorize in the WHITENED basis ---
             L = whiten_factor(cov.to(W.dtype).to(W.device))   # cov = L L^T
@@ -165,7 +177,67 @@ class LatentKV(nn.Module):
 
         self.energy_kept = (S[:r].pow(2).sum() / S.pow(2).sum()).item()
         self.full_rank = int(S.numel())
+        self._finish_init(k_proj, v_proj, blend)
 
+    @torch.no_grad()
+    def _init_grouped(self, Wk, Wv, cov, groups, head_dim, k_ref, d_model):
+        """One latent per GROUP of KV heads, laid out as a single LatentKV.
+
+        Each group g (a set of KV heads) gets its own CARE-whitened SVD of just
+        its K and V rows, truncated at rank r_g. The layer's down projection is
+        the concatenation of the group downs; up_k / up_v are block-structured,
+        head h's rows reading only its group's columns and zeros elsewhere.
+        That is exactly separate per-group latents (cache = sum r_g), expressed
+        as one module, so training, the rebuild and the absorbed-MLA path need
+        no change. The zero blocks are ordinary parameters: training may fill
+        them, letting a head read another group's latent at no cache cost -- the
+        grouping sets the initial factorisation, not a constraint.
+
+        Why group at all. A joint SVD over every KV head spends rank on
+        whichever heads carry the most whitened energy, which is not the same
+        as the heads that retrieve (findings 0.7: the spectral allocator gave
+        the most rank to the layer that retrieves least). Grouping by retrieval
+        score lets retrieval heads be factorised among themselves and given
+        more rank, at the same total cache.
+        """
+        hd = int(head_dim)
+        L = whiten_factor(cov.to(torch.float32).to(Wk.device))
+        Linv = torch.linalg.solve_triangular(
+            L, torch.eye(L.shape[0], device=L.device, dtype=L.dtype), upper=False)
+        R = sum(int(r) for _, r in groups)
+        up_k = torch.zeros(self.k_out, R, device=Wk.device)
+        up_v = torch.zeros(self.v_out, R, device=Wk.device)
+        downs, kept, total, col = [], 0.0, 0.0, 0
+        seen = sorted(h for heads, _ in groups for h in heads)
+        if seen != list(range(self.k_out // hd)):
+            raise ValueError(f"groups must partition the KV heads exactly once, got {groups}")
+        for heads, r in groups:
+            rows = torch.cat([torch.arange(h * hd, (h + 1) * hd) for h in heads]).to(Wk.device)
+            Wg = torch.cat([Wk[rows] * self.k_scale, Wv[rows] * self.v_scale], 0)
+            U, S, Vh = torch.linalg.svd(Wg @ L, full_matrices=False)
+            r = min(int(r), S.numel())
+            up = U[:, :r] * S[:r].unsqueeze(0)
+            downs.append(Vh[:r] @ Linv)
+            nk = rows.numel()
+            up_k[rows, col:col + r] = up[:nk] / self.k_scale
+            up_v[rows, col:col + r] = up[nk:] / self.v_scale
+            kept += float(S[:r].pow(2).sum()); total += float(S.pow(2).sum())
+            col += r
+        R = col
+        dev, dt = k_ref.weight.device, k_ref.weight.dtype
+        self.down = nn.Linear(d_model, R, bias=False).to(dev, dt)
+        self.up_k = nn.Linear(R, self.k_out, bias=False).to(dev, dt)
+        self.up_v = nn.Linear(R, self.v_out, bias=False).to(dev, dt)
+        self.down.weight.copy_(torch.cat(downs, 0).to(dt))
+        self.up_k.weight.copy_(up_k[:, :R].to(dt))
+        self.up_v.weight.copy_(up_v[:, :R].to(dt))
+        self.d_c = R
+        self.whitened = True
+        self.groups = [(list(h), int(r)) for h, r in groups]
+        self.energy_kept = kept / max(total, 1e-30)
+        self.full_rank = 2 * self.k_out
+
+    def _finish_init(self, k_proj, v_proj, blend):
         # optional zero-init blend against the ORIGINAL projections, so the
         # model starts exactly where it was and slides toward the compressed
         # path as `s` learns. Costs the original weights in memory until merged.
@@ -175,7 +247,9 @@ class LatentKV(nn.Module):
             self.v_ref = v_proj
             for p in (*self.k_ref.parameters(), *self.v_ref.parameters()):
                 p.requires_grad_(False)
-            self.s = nn.Parameter(torch.tensor(-6.0, device=dev, dtype=torch.float32))
+            self.s = nn.Parameter(torch.tensor(-6.0, device=self.down.weight.device,
+                                               dtype=torch.float32))
+
 
     def forward(self, x):
         c = self.down(x)
@@ -316,7 +390,11 @@ def whitened_spectra(model, covs):
 
 
 def convert_to_mla(model, d_c=None, energy=0.95, blend=False, verbose=True,
-                   covs=None, budget=None, v_metric=False, alloc=None):
+                   covs=None, budget=None, v_metric=False, alloc=None,
+                   groups=None):
+    """groups: optional {trunk_layer: [(kv_head_indices, rank), ...]} -- one
+    latent per group of KV heads (LatentKV._init_grouped); a layer's d_c is
+    then the sum of its group ranks. Overrides d_c / alloc / budget there."""
     """Replace k_proj/v_proj on every full-attention layer with a shared latent.
 
     d_c=None selects per-layer ranks by spectral energy; an int forces one rank
@@ -361,8 +439,13 @@ def convert_to_mla(model, d_c=None, energy=0.95, blend=False, verbose=True,
             cfg = getattr(model.config, "text_config", model.config)
             vm = LatentKV.v_output_metric(
                 sa.o_proj, cfg.num_key_value_heads, cfg.head_dim)
+        g_i = (groups or {}).get(i)
+        if g_i is not None:
+            cfg = getattr(model.config, "text_config", model.config)
+            r = sum(int(rr) for _, rr in g_i)
         lat = LatentKV(sa.k_proj, sa.v_proj, r, blend=blend,
-                       cov=(covs or {}).get(i), v_metric=vm)
+                       cov=(covs or {}).get(i), v_metric=vm, groups=g_i,
+                       head_dim=(cfg.head_dim if g_i is not None else None))
         sa.k_proj = FactoredKProj(lat, "k")
         sa.v_proj = FactoredKProj(lat, "v")
         # deliberately NOT registered as sa._kv_latent: it is already a child

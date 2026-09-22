@@ -38,8 +38,13 @@ from mercurius.recovery.train import CKPT
 from mercurius.eval import ruler_gen as R
 from mercurius.paths import CACHE_DIR, CKPT_DIR
 
-DEFAULT_TASKS = ["niah_single_1", "niah_single_2", "niah_single_3",
-                 "niah_multikey_1", "niah_multikey_2", "niah_multikey_3",
+# Single-needle tasks are dropped from the default: every arm measured --
+# originals, 50-step and 150-step students -- scored 100% EM at every length
+# from 4k to 32k, so they separate nothing and cost a third of the sweep. Pass
+# --tasks with them to re-check after a change that could plausibly break
+# single-fact recall.
+SINGLE_TASKS = ["niah_single_1", "niah_single_2", "niah_single_3"]
+DEFAULT_TASKS = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3",
                  "niah_multivalue", "niah_multiquery"]
 
 
@@ -173,6 +178,8 @@ def main():
                          "from earlier adapters (the 0.8B arms used "
                          "ckpt/adapters-combined.pt); none for a fresh run")
     ap.add_argument("--dc", type=int, default=512)
+    ap.add_argument("--mla-groups", default=None,
+                    help="grouped-latent spec the checkpoint was trained with")
     ap.add_argument("--quantize", action="store_true",
                     help="rebuild converted arms with the trainer's NF4 step "
                          "(--student-bits 4); ORIGINAL_NF4 is the matching baseline")
@@ -218,7 +225,8 @@ def main():
         m = (build_original() if path == "ORIGINAL"
              else build_original_nf4() if path == "ORIGINAL_NF4"
              else build(path, a.dc, a.covs, init_adapters=a.init_adapters,
-                        alloc=_alloc, quantize=a.quantize))
+                        alloc=_alloc, quantize=a.quantize,
+                        groups=a.mla_groups))
         pacer.attach(m)
         res = {}
         for task in a.tasks:

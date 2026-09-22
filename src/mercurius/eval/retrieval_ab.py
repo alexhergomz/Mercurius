@@ -114,7 +114,7 @@ def build_original():
 
 
 def build(adapters, dc, covs_path, double_adapter=False, init_adapters=None,
-          alloc=None, quantize=False, merge_eval=False):
+          alloc=None, quantize=False, merge_eval=False, groups=None):
     """Reconstruct a trained model.
 
     double_adapter reproduces the pre-2026-09-13 injection, which wrapped every
@@ -236,8 +236,12 @@ def build(adapters, dc, covs_path, double_adapter=False, init_adapters=None,
     if dc:
         covs = {int(k): v.cuda().float()
                 for k, v in torch.load(covs_path, map_location="cpu").items()}
+        if isinstance(groups, str):
+            import json as _json
+            _gj = _json.load(open(groups))["groups"]
+            groups = {int(l): [(list(h), int(r)) for h, r in g] for l, g in _gj.items()}
         convert_to_mla(m, d_c=(None if alloc else dc), alloc=alloc,
-                       covs=covs, verbose=bool(alloc))
+                       covs=covs, verbose=bool(alloc), groups=groups)
     # Per-head query maps, if the run had them. Detected from the artifact: the
     # R tensors exist only if install_per_head_q ran, and it runs last, after the
     # MLA conversion, so the rebuild must apply it at the same point.
@@ -245,6 +249,14 @@ def build(adapters, dc, covs_path, double_adapter=False, init_adapters=None,
         from mercurius.surgery.perhead_q import install_per_head_q
         install_per_head_q(m, verbose=False)
         print("    replayed per-head query maps", flush=True)
+
+    # ScaleNorm, if the run converted the folded norms: detected from the
+    # artifact -- a scalar gain is 0-dimensional where an RMSNorm gain is a
+    # vector. Must happen before the load so the shapes match.
+    if any(k.endswith("layernorm.weight") and v.dim() == 0 for k, v in sd.items()):
+        from mercurius.surgery.scalenorm import convert_to_scalenorm
+        n_sn, _ = convert_to_scalenorm(m, verbose=False)
+        print(f"    replayed ScaleNorm on {n_sn} folded norms", flush=True)
 
     # Conv MTP head, if the run had one. It never touches the t+1 prediction,
     # so evaluation is unaffected either way; rebuilt so its tensors load
