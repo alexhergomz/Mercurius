@@ -89,3 +89,78 @@ token, not more workers (slots share the same memory bandwidth):
 
 Left at pilot settings deliberately: the pilot measures quality and filter
 rates, and changing the economics at the same time would confound both.
+
+
+## 6. Task statements must come from code, not from people
+
+SWE-style trajectory datasets prompt the agent with a problem statement. Where
+that statement is a real GitHub issue or pull-request description, it is prose
+written by a person and is NOT covered by the repository's licence, whatever
+licence the dataset collection carries. Such rows are rejected:
+
+| source | statement | verdict |
+|---|---|---|
+| AweAI-Team/Scale-SWE | card: "the issue description conveying the bug"; no licence tag | rejected |
+| nebius/SWE-rebench-V2 | card: "derived from real GitHub issues and pull requests" | rejected |
+| nvidia/SWE-Zero, SWE-Hero | prompts are verbatim bug reports | rejected |
+| R2E-Gym (SWE-GEN) | synthesised from the commit by back-translation (arXiv:2504.07164) | accepted |
+| SWE-smith | tasks synthesised by perturbing code | accepted |
+| our own episodes | written by the teacher from the repository's code | accepted |
+
+Consequence, measured: nvidia/Open-SWE-Traces is excluded ENTIRELY -- every row
+sampled traces back to Scale-SWE or SWE-rebench -- even though it was the
+strongest candidate on every other axis. nvidia/Nemotron-SWE-v1 (R2E-Gym tasks,
+Qwen3-Coder trajectories) passes. Unknown provenance counts as rejected, not as
+clean. A regex over the first messages also drops anything that still reads like
+a pasted human report (bug-report templates, issue URLs, "@user wrote").
+
+Licences stated as a URL rather than an SPDX id are resolved against GitHub's
+own detection before judging them, so a permissive repository is not dropped
+over a formatting difference; NOASSERTION remains excluded.
+
+## 7. Attribution
+
+scripts/build_attribution.py writes data/ATTRIBUTION.md (every repository with
+licence, commit and token count; every third-party dataset with licence,
+task provenance and generator) and data/NOTICE, the short form to ship with a
+model release. Permissive does not mean obligation-free: MIT, BSD and Apache
+require the notice to travel with substantial portions, and CC-BY requires
+attribution. Copyright headers inside repository content are deliberately NOT
+scrubbed for this reason (only secrets and e-mail addresses are).
+
+## 8. Ethical review
+
+What is checked, and what it costs:
+
+- **Consent.** The Stack's opt-out requests are honoured, including the
+  requester's own account even when they listed only some repositories: 8,219
+  requests, 14 of our admitted repositories removed.
+- **Privacy.** Secrets and e-mail addresses are replaced in every message, not
+  only in tool output. Names in licence headers are kept, because attribution
+  requires them -- a deliberate trade recorded here rather than silently made.
+- **Authorship.** No issue or PR prose (section 6); no scraped forum or chat
+  text; no model outputs whose terms forbid training.
+- **Evaluation integrity.** SWE-bench Verified repositories excluded from
+  training; RULER and WikiText held out.
+- **Not currently checked, and worth stating:** repository content is not
+  screened for offensive comments or for dual-use security tooling. Both exist
+  in open-source code. A content screen over tool outputs would be cheap to add
+  if wanted; today the only content filters are the secret/e-mail scrub and the
+  binary/vendored exclusions.
+
+## 9. Audits actually run (2026-09-23)
+
+| check | result |
+|---|---|
+| licence TEXT vs GitHub's SPDX tag, 144 clones | 0 repositories carry added restrictions (Commons Clause, non-commercial, no-derivatives, "may not be used to train"). Two Apache-2.0 files flagged by a first pass were false positives -- standard Apache text -- and the rule was corrected rather than the finding waved away |
+| AI opt-out markers (`.noai`, `NOAI`, `ai.txt`, robots directives) in clones | 0 found; the check stays in case later batches have them |
+| The Stack opt-out list | 8,219 requests parsed; 14 admitted repositories removed, including the requester's own account even when they listed only some repositories |
+| task-statement provenance | Open-SWE-Traces rejected entirely (every sampled row traces to Scale-SWE or SWE-rebench, i.e. human issue text); Nemotron-SWE-v1 (R2E-Gym, synthesised statements) accepted |
+| model licences | Qwen3.5-4B, Qwen3.5-27B and the 4-bit GGUF are all Apache-2.0 and ungated, so outputs may be used as training targets and a modified model may be released with a NOTICE and a statement of changes |
+| corpora | training data is ODC-BY (FineWeb-Edu and things derived from it). WikiText (CC-BY-SA/GFDL), PG-19 and the Paul Graham essay haystack are EVALUATION ONLY and never trained on -- the essays in particular are the author's copyright whatever the mirror is tagged |
+
+Residual items, stated rather than hidden: the PG-19 mirror carries no licence
+tag (the books themselves are public domain); the RULER haystack should be
+swapped for public-domain text before any evaluation artifact is distributed;
+and repository content is not screened for offensive comments or dual-use
+security tooling.

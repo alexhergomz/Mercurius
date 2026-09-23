@@ -671,6 +671,16 @@ def main():
                          "Unlike --ce-beta this carries the teacher term's own "
                          "scale, so it is portable across divergences; --ce-beta "
                          "in reverse mode is ~216x data-dominated and diverges")
+    ap.add_argument("--episodes", default=None, metavar="JSONL",
+                    help="agent episodes (data/episodes/*.jsonl), rendered "
+                         "through the chat template with their tool schemas. "
+                         "One episode per step at its natural length; longer "
+                         "than --seq keeps the first --seq tokens, which is the "
+                         "part carrying the system prompt, the task and the "
+                         "early turns.")
+    ap.add_argument("--episode-frac", type=float, default=0.3, metavar="F",
+                    help="fraction of steps that draw an episode instead of a "
+                         "corpus window")
     ap.add_argument("--synth-data", default=None, metavar="PATH",
                     help="extra corpus of synthetic multi-item recall documents "
                          "(src/synth_recall.py). Appended to the document pool, so "
@@ -952,8 +962,33 @@ def main():
                          "off. The trunk's own lm_head keeps t+1 untouched. Head j "
                          "is distilled against the teacher's logits at t+j, which "
                          "the main loss already computes.")
-    ap.add_argument("--mtp-weight", type=float, default=0.1,
-                    help="weight on the MTP loss (mean over heads)")
+    ap.add_argument("--mtp-weight", type=float, default=1.0,
+                    help="weight on the MTP loss (weighted mean over heads). "
+                         "1.0 with --mtp-detach is Medusa-1's arrangement: the "
+                         "heads are a first-class objective and the trunk is "
+                         "not touched by them. A weight below 1 only means "
+                         "something when the gradient does reach the trunk "
+                         "(DeepSeek-V3: lambda 0.3 then 0.1 over 14.8T tokens).")
+    ap.add_argument("--mtp-detach", action="store_true", default=True,
+                    help="train the MTP heads on DETACHED hidden states, so "
+                         "their gradient never reaches the trunk (Medusa-1 "
+                         "freezes the backbone for this reason). Our main term "
+                         "is an excess against the teacher, near zero by "
+                         "construction (0.38 nats at the end of run D), while a "
+                         "head's excess cannot be -- it is scored against a "
+                         "teacher that saw j more tokens (6.2 nats) -- so a "
+                         "shared gradient lets the heads dominate a run whose "
+                         "purpose is repair.")
+    ap.add_argument("--no-mtp-detach", dest="mtp_detach", action="store_false",
+                    help="let the MTP loss train the trunk as well (Gloeckle et "
+                         "al.'s joint objective; there every head is an ordinary "
+                         "cross-entropy of the same order, which is not the case "
+                         "here)")
+    ap.add_argument("--mtp-head-decay", type=float, default=0.8,
+                    help="per-head weight decay^j over depths (Medusa's "
+                         "lambda_k = 0.8^k), since a head's loss grows with how "
+                         "far ahead it predicts. 1.0 weights heads equally "
+                         "(Gloeckle et al.).")
     ap.add_argument("--mtp-lr", type=float, default=1e-3,
                     help="own LR group for the head. At init z_j = h exactly, so "
                          "until its zero-init output projection opens, the MTP "
@@ -1569,6 +1604,12 @@ def main():
         print(f"  pull-to-init {a.pull_to_init:g} on {len(pull_ref)} inherited "
               f"tensors ({mb:.2f} GB reference copy)", flush=True)
 
+    ep_ds = None
+    if a.episodes:
+        from mercurius.data.episode_ds import EpisodeDataset
+        ep_ds = EpisodeDataset(a.episodes, tok)
+        print(f"  episode mix: {a.episode_frac:.0%} of steps", flush=True)
+
     taid = (TAIDSchedule(a.steps, a.taid_start, a.taid_end, a.taid_alpha,
                          a.taid_beta, adaptive=not a.taid_linear)
             if a.taid else None)
@@ -1781,7 +1822,13 @@ def main():
     gen = (sequential_batches(sample_ids, sl, a.steps - start_step) if a.state_passing
            else batches(sample_ids, sl, a.steps - start_step, align=align,
                        gen=_bg, spans=doc_spans))
+    _eg = torch.Generator().manual_seed(4242)      # episode draws, own stream
     for step, (batch, new_doc, batch_offset) in enumerate(gen, start=start_step + 1):
+        if ep_ds is not None and float(torch.rand(1, generator=_eg)) < a.episode_frac:
+            _ep = ep_ds.sample(_eg, a.seq)
+            if _ep is not None:
+                # an episode is its own document: reset any carried state
+                batch, new_doc, batch_offset = _ep.unsqueeze(0), True, -1
         # TAID's target walks from the student's own distribution to the
         # teacher's as training proceeds; ignored by the other modes
         _taid_lam = taid.t if taid is not None else 1.0
@@ -1900,7 +1947,11 @@ def main():
                 # Main loss and all MTP heads together (_chunk_mtp_terms): the
                 # teacher's log-softmax is formed once per chunk for every
                 # offset, and the student's K+1 row sets go through one GEMM.
-                z = student.mtp_head(h_s.unsqueeze(0))[0]      # (T, K, d)
+                _h_mtp = h_s.detach() if a.mtp_detach else h_s
+                z = student.mtp_head(_h_mtp.unsqueeze(0))[0]   # (T, K, d)
+                _w = torch.tensor([a.mtp_head_decay ** j for j in range(1, a.mtp + 1)],
+                                  device=h_s.device, dtype=torch.float32)
+                _w = _w / _w.sum()
                 m_tot, m_n = 0.0, 0
                 for i in range(op_lo, L - 1, a.fullkl_chunk):
                     j = min(i + a.fullkl_chunk, L - 1)
@@ -1914,8 +1965,11 @@ def main():
                                        use_reentrant=False)
                     tot = tot + terms[:, 0].sum(-1)
                     n += j - i
-                    m_tot = m_tot + (terms[0, 1:] + a.ce_beta * terms[1, 1:]).sum()
-                    m_n += int(n_rows[1:].sum())
+                    # weighted mean over heads (rows with no target are
+                    # already zero), plain mean over positions
+                    _per_head = (terms[0, 1:] + a.ce_beta * terms[1, 1:]).sum(-1)
+                    m_tot = m_tot + (_w * _per_head).sum()
+                    m_n += int(n_rows[1:].sum()) / max(a.mtp, 1)
                 mtp_loss = m_tot / max(m_n, 1)
                 del z
             else:

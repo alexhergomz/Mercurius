@@ -315,6 +315,59 @@ they do not predict trained accuracy. A separating screen buys the training arms
 
 ---
 
+## Drafting for decode (measured, then options)
+
+Decode is 12 tok/s (83 ms/token) for the NF4 student through HF eager --
+bitsandbytes dequantises per matmul at batch 1 and every layer pays Python
+dispatch. Whatever drafts, it multiplies THAT number, so the export path
+(merged adapters, absorbed MLA, an efficient engine) is worth more than any
+draft mechanism until it is fixed.
+
+### Conv MTP head -- MEASURED, not useful as a draft yet
+Acceptance against the model's OWN greedy token (the quantity that makes
+speculative decoding lossless), run E, 8,187 positions: head 1 4.9%, heads 2-4
+~3%, chained tau = 1.06 -> 1.00x. Run D (attached, weight 0.1) was the same,
+5.3%. The head is 66 K parameters with a 15-token receptive field against
+Medusa's d x d per head (~6.5 M here), and it saw 1.2 M tokens. It also costs
+~38% of training throughput (199 tok/s against 323) through the extra
+full-vocabulary passes.
+Attached, it also COST the trunk: run D 9.791 ppl@8192 against run E's 9.428
+with the same head detached (Medusa-1's arrangement). Dropped from recovery.
+Worth revisiting only in a dedicated phase: frozen trunk, a bigger head, many
+more tokens.
+
+### Qwen3.5's own MTP module -- available, untested here
+Both checkpoints ship it (15 tensors, ~50 M in the 4B): fc(5120->2560) over
+[norm(h_t); norm(emb(x_{t+1}))], one transformer layer, norm, then lm_head.
+transformers ignores it on load (`_keys_to_ignore_on_load_unexpected`), so the
+pipeline has been discarding a trained component.
+It is SEQUENTIAL: it conditions on the true next token, so it does not ask
+h_t to encode t+2 by itself. That is why DeepSeek-V3 and Qwen can train this
+form attached (lambda 0.3 -> 0.1) and claim a representation benefit, and why
+our parallel head could not. The teacher has the same module, so its output is
+a free distillation target, exactly like the main head.
+Cost as a draft: its attention layer carries a FULL-WIDTH KV cache, which
+partly undoes the 4x compression while drafting -- it would want the same MLA
+conversion the trunk gets.
+Expectation if tried: small. The literature's gains are pretraining-scale and
+Gloeckle et al. report MTP can hurt smaller models; recovery here is 1.2 M
+tokens.
+
+### Tiny diffusion drafter over the MLA latent -- idea
+A small discrete-diffusion (masked-token) drafter proposes a BLOCK of k tokens
+in parallel by denoising, which is what a draft wants, instead of k sequential
+steps. The reason it fits this model specifically: after stage D the KV cache
+IS a compact shared latent c (512 dims per layer), so a drafter can attend over
+the cache the trunk already holds rather than carrying its own -- the cost that
+makes the sequential MTP module awkward.
+What it needs, in order: the export/decode path first (drafting a 12 tok/s
+baseline is not worth engineering), then a drafter that reads c, then the
+verification path (which exists: chunked continuation is exact, and the
+recurrent state snapshot for rollback is ~50 MB). Unknowns: whether a small
+diffusion LM proposes well enough to clear the acceptance bar that the conv
+head missed, and whether block proposals survive the linear layers' recurrence
+on rejection.
+
 ## Tier 4 — speculative, or expensive for the expected return
 
 ### 4.1 Mixture of VeRA experts

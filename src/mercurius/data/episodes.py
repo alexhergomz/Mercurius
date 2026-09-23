@@ -52,7 +52,9 @@ File tree (truncated):
 One source file, `{path}`:
 {code}
 
-Write {n} diverse, specific tasks a developer might actually ask about THIS repository. Mix: locating where something is implemented, explaining how a mechanism works end to end, planning a concrete change (which files and functions to modify and how), and understanding what a test checks. Each task must be answerable by exploring the repository. Where the answer includes a specific file path, give it as "answer_path" (repository-relative); otherwise use null.
+Write {n} diverse, specific tasks a developer might actually ask about THIS repository. Mix: locating where something is implemented, explaining how a mechanism works end to end, planning a concrete change (which files and functions to modify and how), and understanding what a test checks.
+
+Each task MUST require inspecting AT LEAST THREE different files to answer properly -- trace a call path across modules, compare an implementation with its tests and its callers, or plan a change that touches several components. Avoid anything answerable from a single file or a single search. Each task must still be answerable by exploring this repository alone. Where the answer includes a specific file path, give it as "answer_path" (repository-relative); otherwise use null.
 
 Reply with ONLY a JSON list: [{{"task": "...", "kind": "locate|explain|plan|test", "answer_path": "... or null"}}]"""
 
@@ -132,11 +134,30 @@ def _args(call):
     return a
 
 
-def rollout(teacher, env, repo, task, max_turns=20):
+FINAL_NUDGE = ("You have used your exploration budget. Give your final answer "
+               "now, with the file paths and line numbers you found.")
+
+
+def rollout(teacher, env, repo, task, max_turns=30, token_budget=50_000):
+    """token_budget: wind the episode up (final answer) before the server's
+    per-slot context runs out. Hitting it instead returns an HTTP error and
+    loses the WHOLE trajectory -- 28% of attempts in the first build, and by
+    construction the longest ones. Estimated at ~3.5 characters per token,
+    which is close enough for a margin this size."""
     msgs = [{"role": "system", "content": SYSTEM.format(repo=repo)},
             {"role": "user", "content": task["task"]}]
     seen = {}
+    chars = lambda: sum(len(m.get("content") or "") + len(m.get("reasoning_content") or "")
+                        for m in msgs)
     for _ in range(max_turns):
+        if chars() / 3.5 > token_budget:
+            msgs.append({"role": "user", "content": FINAL_NUDGE})
+            out = teacher.chat(msgs, tools=TOOLS)
+            fin = {"role": "assistant", "content": out.get("content") or ""}
+            if out.get("reasoning_content"):
+                fin["reasoning_content"] = out["reasoning_content"]
+            msgs.append(fin)
+            return msgs, ("answered" if fin["content"].strip() else "empty_answer")
         out = teacher.chat(msgs, tools=TOOLS)
         calls = out.get("tool_calls") or []
         turn = {"role": "assistant", "content": out.get("content") or ""}
@@ -145,6 +166,18 @@ def rollout(teacher, env, repo, task, max_turns=20):
         if not calls:
             msgs.append(turn)
             return msgs, "answered"
+        if len(msgs) >= 2 * max_turns - 2:      # one turn left: ask for the answer
+            msgs.append(turn)
+            for c in turn["tool_calls"]:
+                msgs.append({"role": "tool", "content": env.call(
+                    c["function"]["name"], c["function"]["arguments"])})
+            msgs.append({"role": "user", "content": FINAL_NUDGE})
+            out = teacher.chat(msgs, tools=TOOLS)
+            fin = {"role": "assistant", "content": out.get("content") or ""}
+            if out.get("reasoning_content"):
+                fin["reasoning_content"] = out["reasoning_content"]
+            msgs.append(fin)
+            return msgs, ("answered" if fin["content"].strip() else "empty_answer")
         turn["tool_calls"] = [{"type": "function", "function": {
             "name": c["function"]["name"], "arguments": _args(c)}} for c in calls]
         msgs.append(turn)

@@ -63,7 +63,7 @@ TOOLS = [
             "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "read_file",
-        "description": f"Read a file, optionally a line range (1-based, inclusive). At most {MAX_READ_LINES} lines are returned per call.",
+        "description": "Read a file, optionally a line range (1-based, inclusive).",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"},
             "start_line": {"type": "integer"},
@@ -102,7 +102,13 @@ def _terms(text):
 
 
 class RepoEnv:
-    def __init__(self, root):
+    def __init__(self, root, max_read_lines=MAX_READ_LINES, search_k=5,
+                 max_out_chars=MAX_OUT_CHARS):
+        """max_read_lines / search_k / max_out_chars set how much real
+        repository text one tool call returns. They are the lever on generation
+        economics: the teacher's decode is the bottleneck, so more content per
+        decision is more training data at the same cost (docs/data_policy.md)."""
+        self.max_read_lines, self.search_k, self.max_out = max_read_lines, search_k, max_out_chars
         self.root = os.path.realpath(root)
         self.files = []
         for d, dirs, fs in os.walk(self.root):
@@ -128,9 +134,8 @@ class RepoEnv:
         except (UnicodeDecodeError, OSError):
             return None
 
-    @staticmethod
-    def _cap(s):
-        return s if len(s) <= MAX_OUT_CHARS else s[:MAX_OUT_CHARS] + "\n... [output truncated]"
+    def _cap(self, s):
+        return s if len(s) <= self.max_out else s[:self.max_out] + "\n... [output truncated]"
 
     # -- tools
     def list_dir(self, path="."):
@@ -156,7 +161,8 @@ class RepoEnv:
             return f"Error: {path} is not UTF-8 text"
         lines = txt.splitlines()
         s = max(1, int(start_line or 1))
-        e = min(len(lines), int(end_line or s + MAX_READ_LINES - 1), s + MAX_READ_LINES - 1)
+        e = min(len(lines), int(end_line or s + self.max_read_lines - 1),
+                s + self.max_read_lines - 1)
         body = "\n".join(f"{i:>5}\t{lines[i - 1]}" for i in range(s, e + 1))
         more = f"\n... ({len(lines) - e} more lines)" if e < len(lines) else ""
         return self._cap(scrub(body) + more)
@@ -181,7 +187,12 @@ class RepoEnv:
                         return self._cap(scrub("\n".join(hits)) + "\n... (more results)")
         return self._cap(scrub("\n".join(hits)) or "No matches.")
 
-    def _build_index(self, chunk_lines=60):
+    def _build_index(self, chunk_lines=120):
+        """120-line chunks, not 60: a search hit then carries a whole function
+        with its context, which is both more useful to the agent and more real
+        repository text per generated decision -- the teacher's decode is the
+        bottleneck (docs/data_policy.md).
+        """
         chunks = []
         for f in self.files:
             txt = self._text(f)
@@ -217,7 +228,8 @@ class RepoEnv:
             if s > 0:
                 scored.append((s, c))
         scored.sort(key=lambda x: -x[0])
-        out = [f"--- {c[0]} (lines {c[1]}-{c[2]})\n{c[3]}" for _, c in scored[:int(k or 5)]]
+        out = [f"--- {c[0]} (lines {c[1]}-{c[2]})\n{c[3]}"
+               for _, c in scored[:int(k or self.search_k)]]
         return self._cap(scrub("\n\n".join(out)) or "No results.")
 
     def call(self, name, args):
