@@ -32,10 +32,18 @@ def main():
     ap.add_argument("--lengths", nargs="+", type=int, default=[4096, 8192])
     ap.add_argument("--samples", type=int, default=3)
     ap.add_argument("--out", default=str(LOGS_DIR / "retrieval_heads_4b.json"))
+    ap.add_argument("--filler", default=None, metavar="TXT",
+                    help="haystack text. The default is FineWeb prose, which "
+                         "scores which heads retrieve a needle FROM PROSE. Half "
+                         "our training mix is code, and the heads that find a "
+                         "symbol in a repository are not necessarily the ones "
+                         "that find a fact in an article -- so the grouping and "
+                         "rank allocation derived from prose scores carry the "
+                         "same domain bias as prose-calibrated whitening.")
     a = ap.parse_args()
     guard.cap_cuda_memory(60)
     tok = AutoTokenizer.from_pretrained(str(STAGE_AB))
-    filler = re.sub(r"\s+", " ", open(FINEWEB_LONG, encoding="utf-8",
+    filler = re.sub(r"\s+", " ", open(a.filler or FINEWEB_LONG, encoding="utf-8",
                                       errors="replace").read(3_000_000))
     m = load_kda_model(str(STAGE_AB), dtype=torch.bfloat16)
     install_rope_dial(m, 0, "global")

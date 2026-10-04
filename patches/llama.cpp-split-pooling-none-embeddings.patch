@@ -1,0 +1,89 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b6835e4..ec984f7 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -366,8 +366,15 @@ struct server_slot {
+     int64_t t_print_last = 0;
+     int32_t n_gen_last = 0;
+ 
++    // per-token embeddings of a SPLIT pooling-none prompt (mercurius patch): a causal
++    // model's hidden state at token t depends only on tokens <= t, so a prompt larger
++    // than n_ubatch can be decoded chunk by chunk through the KV cache and the
++    // per-token outputs concatenated.
++    std::vector<std::vector<float>> embd_accum;
++
+     void reset() {
+         SLT_DBG(*this, "%s", "\n");
++        embd_accum.clear();
+ 
+         spec_is_replay = false;
+ 
+@@ -443,7 +450,20 @@ struct server_slot {
+ 
+         return
+             !task->need_embd() ||
+-            (llama_get_memory(ctx_tgt) && llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST);
++            (llama_get_memory(ctx_tgt) && llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST) ||
++            split_embd_none();
++    }
++
++    // mercurius patch: causal model, no pooling -> per-token outputs can be split
++    bool split_embd_none() const {
++        // opt-in: only valid for a CAUSAL model (no getter for that here), so the
++        // operator asserts it -- LLAMA_SPLIT_EMBD_NONE=1
++        static const bool enabled = [] {
++            const char * v = getenv("LLAMA_SPLIT_EMBD_NONE");
++            return v != nullptr && v[0] == '1';
++        }();
++        return enabled && task && task->type == SERVER_TASK_TYPE_EMBEDDING && llama_get_memory(ctx_tgt)
++            && llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_NONE;
+     }
+ 
+     bool can_batch_with(server_slot & other_slot) const {
+@@ -2160,6 +2180,13 @@ private:
+ 
+         std::vector<float> embd_res(n_embd_out, 0.0f);
+ 
++        if (slot.split_embd_none()) {
++            res->embedding = slot.embd_accum;       // every chunk, in order
++            SLT_DBG(slot, "sending %d split embeddings\n", (int) res->embedding.size());
++            queue_results.send(std::move(res));
++            return;
++        }
++
+         for (int i = 0; i < batch.n_tokens; ++i) {
+             if (!batch.logits[i] || batch.seq_id[i][0] != slot.id) {
+                 continue;
+@@ -3214,7 +3241,7 @@ private:
+                                 return;
+                             }
+ 
+-                            if (slot.task->params.cache_prompt) {
++                            if (slot.task->params.cache_prompt && !slot.split_embd_none()) {
+                                 // reuse any previously computed tokens that are common with the new prompt
+                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+ 
+@@ -3810,6 +3837,23 @@ private:
+                 }
+             }
+ 
++            if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT)
++                && slot.split_embd_none()) {
++                const int n_embd_out = llama_model_n_embd_out(model_tgt);
++                for (int i = 0; i < batch_view.n_tokens; ++i) {
++                    if (!batch_view.logits[i] || batch_view.seq_id[i][0] != slot.id) {
++                        continue;
++                    }
++                    const float * e = llama_get_embeddings_ith(slot.ctx_tgt, i);
++                    if (e == nullptr) {
++                        SLT_ERR(slot, "failed to get embeddings, token = %d\n", batch_view.token[i]);
++                        slot.embd_accum.emplace_back(n_embd_out, 0.0f);
++                    } else {
++                        slot.embd_accum.emplace_back(e, e + n_embd_out);
++                    }
++                }
++            }
++
+             if (!is_inside_view(slot.i_batch)) {
+                 // the required token not in this sub-batch, skip
+                 return;

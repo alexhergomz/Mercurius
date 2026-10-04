@@ -126,7 +126,14 @@ def score_sample(model, tok, s, gen_tokens):
     g = torch.tensor([gold_ids], device="cuda")
     logits = [first.unsqueeze(0)]
     c2 = copy.deepcopy(cache) if len(gold_ids) > 1 else None
-    for t in range(len(gold_ids) - 1):
+    if c2 is not None and getattr(model, "_supports_continuation", False):
+        # every linear-attention layer continues a cache by a multi-token forward
+        # (models/fast_infer.py), so the span is ONE chunked forward, not a loop
+        o2 = model(input_ids=g[:, :-1], past_key_values=c2, use_cache=True)
+        logits.append(o2.logits[0].float())
+        del o2, c2
+        c2 = None
+    for t in range(len(gold_ids) - 1 if c2 is not None else 0):
         o2 = model(input_ids=g[:, t:t + 1], past_key_values=c2, use_cache=True)
         c2 = o2.past_key_values
         logits.append(o2.logits[0, -1:].float())
@@ -144,11 +151,20 @@ def score_sample(model, tok, s, gen_tokens):
         # greedy decode on the original cache (experiments/test_generate_cache
         # checks cached decoding against cache-free decoding, token for token)
         nxt, toks = first.argmax(), []
+        golds = [str(r).lower() for r in s["outputs"]]
         for _ in range(gen_tokens):
             t = int(nxt)
             if t == tok.eos_token_id:
                 break
             toks.append(t)
+            # EM (string_match_all) only asks whether every gold value is IN the
+            # prediction, and appending tokens cannot remove a substring: once all
+            # are present the score is final. Stops the >=128-token budget early
+            # -- most of a sample's time -- without changing any EM.
+            if len(toks) % 4 == 0:
+                txt = tok.decode(toks, skip_special_tokens=True).lower()
+                if all(gv in txt for gv in golds):
+                    break
             o = model(input_ids=nxt.view(1, 1), past_key_values=cache,
                       use_cache=True)
             cache = o.past_key_values
@@ -177,6 +193,12 @@ def main():
                     help="replayed before the checkpoint for runs that started "
                          "from earlier adapters (the 0.8B arms used "
                          "ckpt/adapters-combined.pt); none for a fresh run")
+    ap.add_argument("--dial", default="nope",
+                    choices=["nope", "k4", "k8", "c1", "k24", "c0"],
+                    help="MUST match the arm's training --dial. build() defaults to "
+                         "nope, so WITHOUT THIS FLAG a c0 arm was silently evaluated "
+                         "with NoPE installed -- the wrong architecture, reported as "
+                         "a confident number. Same hole bench_full.py had.")
     ap.add_argument("--dc", type=int, default=512)
     ap.add_argument("--mla-groups", default=None,
                     help="grouped-latent spec the checkpoint was trained with")
@@ -195,7 +217,31 @@ def main():
                          "uniform, spectral or retrieval")
     ap.add_argument("--covs", default=str(CACHE_DIR / 'kv_covs_4b.pt'))
     ap.add_argument("--out", default="logs/ruler.json")
+    ap.add_argument("--qat", action="store_true",
+                    help="rebuild as the DEPLOYED 4-bit model (models/qat.py) -- "
+                         "required for checkpoints of a --qat run")
+    ap.add_argument("--qat-kv-bits", type=int, default=4)
+    ap.add_argument("--qat-kv-group", type=int, default=32)
+    ap.add_argument("--qat-kv-rot", default="none", choices=["none", "orth"])
+    ap.add_argument("--qat-kv-quant", default="int", choices=["int", "tq"],
+                    help="KV latent quantizer: int = symmetric int, fp16 scale per "
+                         "--qat-kv-group; tq = TurboQuant-MSE (no QJL): random rotation, "
+                         "fp16 norm per token, Beta Lloyd-Max codebook (#66)")
+    ap.add_argument("--qat-gate-bits", type=int, default=4)
+    ap.add_argument("--qat-embed-bits", type=int, default=4)
+    ap.add_argument("--merge-eval", action="store_true",
+                    help="merge VeRA into bf16 bases for inference (build(merge_eval=True)): "
+                         "~2.5x faster at rank 1024, numerics differ only by one bf16 "
+                         "rounding of the merged weight -- check with replay_check --merge-eval")
+    ap.add_argument("--fast-infer", action="store_true",
+                    help="models/fast_infer.py: chunked kernels for every multi-token "
+                         "input incl. cache continuation, Triton conv update for decode; "
+                         "RULER then scores the gold span in ONE forward")
     a = ap.parse_args()
+    _qat = (dict(kv_bits=a.qat_kv_bits, kv_group=a.qat_kv_group, kv_rot=a.qat_kv_rot,
+                 gate_bits=a.qat_gate_bits, embed_bits=a.qat_embed_bits,
+                 kv_quant=a.qat_kv_quant)
+            if a.qat else None)
     guard.cap_cuda_memory(a.mem_cap_gb)
     pacer = guard.ThermalPacer(a.gpu_temp_pause, a.gpu_temp_resume, 90.0, 85.0)
 
@@ -222,16 +268,17 @@ def main():
     for spec in a.arms:
         tag, path = spec.split("=", 1)
         t0 = time.perf_counter()
-        m = (build_original() if path == "ORIGINAL"
-             else build_original_nf4() if path == "ORIGINAL_NF4"
+        m = (build_original(fast_infer=a.fast_infer) if path == "ORIGINAL"
+             else build_original_nf4(fast_infer=a.fast_infer) if path == "ORIGINAL_NF4"
              else build(path, a.dc, a.covs, init_adapters=a.init_adapters,
                         alloc=_alloc, quantize=a.quantize,
-                        groups=a.mla_groups))
+                        groups=a.mla_groups, dial=a.dial, qat=_qat,
+                        merge_eval=a.merge_eval, fast_infer=a.fast_infer))
         pacer.attach(m)
         res = {}
         for task in a.tasks:
             for n in a.lengths:
-                nlls, nllv, preds, refs, oom = [], [], [], [], 0
+                nlls, nllv, preds, refs, oom, idx = [], [], [], [], 0, []
                 lim = a.em_samples or len(data[(task, n)])
                 for si, s in enumerate(data[(task, n)]):
                     # One OOM at the longest length must not destroy the whole
@@ -243,7 +290,7 @@ def main():
                         oom += 1
                         torch.cuda.empty_cache()
                         continue
-                    nlls.append(nll); nllv.append(nll_v)
+                    nlls.append(nll); nllv.append(nll_v); idx.append(si)
                     if si < lim:
                         preds.append(pred); refs.append(s["outputs"])
                 if not nlls:
@@ -261,6 +308,12 @@ def main():
                     "n_em": len(preds),
                     "oom": oom,
                     "example_pred": preds[0][:80] if preds else "",
+                    # PER-SAMPLE values (2026-09-29) so arms can be compared by a
+                    # PAIRED test on byte-identical samples; idx keeps the pairing
+                    # exact even when a sample OOMs in one arm and not another.
+                    "idx": idx, "nll_s": nlls, "nll_v_s": nllv,
+                    "em_s": ([R.string_match_all([p_], [r_]) for p_, r_ in zip(preds, refs)]
+                             if a.gen_tokens and preds else None),
                 }
                 print(f"  {tag:<14} {task:<16}@{n:<6} "
                       f"NLL {res[f'{task}@{n}']['nll']:6.3f}"

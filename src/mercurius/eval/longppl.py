@@ -80,7 +80,14 @@ def position_nll(model, ids, chunk=4096):
     """Per-position NLL for one sequence, from a single forward."""
     x = ids.unsqueeze(0).cuda()
     h = get_trunk(model)(input_ids=x, use_cache=False).last_hidden_state[0]
-    W = model.get_output_embeddings().weight
+    _head = model.get_output_embeddings()
+    # see ce_and_topk: after a head swap there is no single weight matrix
+    _proj = getattr(_head, "project", None)
+    if _proj is not None:
+        h = _proj(h)                     # into the teacher's basis; W_t decodes it
+        W = _head.head.weight
+    else:
+        W = _head.weight
     out = torch.empty(x.shape[1] - 1, dtype=torch.float32, device="cuda")
     for i in range(0, x.shape[1] - 1, chunk):
         j = min(i + chunk, x.shape[1] - 1)
@@ -96,6 +103,12 @@ def main():
                     help="tag=path; path ORIGINAL (bf16) or ORIGINAL_NF4 for baselines")
     ap.add_argument("--max-len", type=int, default=131072)
     ap.add_argument("--books", type=int, default=4)
+    ap.add_argument("--dial", default="nope",
+                    choices=["nope", "k4", "k8", "c1", "k24", "c0"],
+                    help="MUST match the arm's training --dial. build() defaults to "
+                         "nope, so WITHOUT THIS FLAG a c0 arm was silently evaluated "
+                         "with NoPE installed -- the wrong architecture, reported as "
+                         "a confident number. Same hole bench_full.py had.")
     ap.add_argument("--dc", type=int, default=512)
     ap.add_argument("--covs", default=str(CACHE_DIR / "kv_covs_4b.pt"))
     ap.add_argument("--mla-groups", default=None,
@@ -103,6 +116,17 @@ def main():
     ap.add_argument("--quantize", action="store_true")
     ap.add_argument("--mem-cap-gb", type=float, default=90.0)
     ap.add_argument("--out", default=str(LOGS_DIR / "longppl.json"))
+    ap.add_argument("--save-pos", default=None, metavar="NPZ",
+                    help="also save every book's per-position NLL (float16), so arms "
+                         "can be compared PAIRED, position by position, afterwards")
+    ap.add_argument("--merge-eval", action="store_true",
+                    help="merge VeRA into bf16 bases for inference (build(merge_eval=True)): "
+                         "~2.5x faster at rank 1024, numerics differ only by one bf16 "
+                         "rounding of the merged weight -- check with replay_check --merge-eval")
+    ap.add_argument("--fast-infer", action="store_true",
+                    help="models/fast_infer.py: chunked kernels for every multi-token "
+                         "input incl. cache continuation, Triton conv update for decode; "
+                         "RULER then scores the gold span in ONE forward")
     a = ap.parse_args()
 
     guard.cap_cuda_memory(a.mem_cap_gb)
@@ -114,15 +138,17 @@ def main():
     B = buckets(a.max_len)
     print(f"{len(seqs)} books x {a.max_len:,} tokens; buckets {B}", flush=True)
 
-    results = {}
+    results, per_book_all, pos_all = {}, {}, {}
     for spec in a.arms:
         tag, path = spec.split("=", 1)
-        m = (build_original() if path == "ORIGINAL"
-             else build_original_nf4() if path == "ORIGINAL_NF4"
+        m = (build_original(fast_infer=a.fast_infer) if path == "ORIGINAL"
+             else build_original_nf4(fast_infer=a.fast_infer) if path == "ORIGINAL_NF4"
              else build(path, a.dc, a.covs, quantize=a.quantize,
-                        groups=a.mla_groups))
+                        groups=a.mla_groups, dial=a.dial, merge_eval=a.merge_eval,
+                        fast_infer=a.fast_infer))
         pacer.attach(m)
         per_book = []
+        pos = {}
         for bi, ids in enumerate(seqs):
             t0 = time.time()
             try:
@@ -134,6 +160,7 @@ def main():
             row = {f"{lo}-{hi}": nll[lo:hi].mean().item() for lo, hi in B
                    if hi <= len(nll) + 1}
             per_book.append(row)
+            pos[f"{tag}__book{bi}"] = nll.half().numpy()
             print(f"  {tag:<10} book {bi} ({time.time() - t0:5.0f}s) " +
                   " ".join(f"{k}:{math.exp(v):.2f}" for k, v in row.items()),
                   flush=True)
@@ -143,8 +170,13 @@ def main():
         torch.cuda.empty_cache()
         keys = list(per_book[0]) if per_book else []
         results[tag] = {k: sum(r[k] for r in per_book) / len(per_book) for k in keys}
+        per_book_all[tag] = per_book
         json.dump({"max_len": a.max_len, "books": [b["title"] for b in books],
-                   "nll": results}, open(a.out, "w"), indent=1)
+                   "nll": results, "per_book": per_book_all}, open(a.out, "w"), indent=1)
+        if a.save_pos:
+            import numpy as np
+            pos_all.update(pos)
+            np.savez(a.save_pos, **pos_all)
 
     print("\nperplexity by position bucket (mean NLL over books, exponentiated)")
     keys = [f"{lo}-{hi}" for lo, hi in B]

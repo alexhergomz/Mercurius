@@ -146,6 +146,18 @@ def rollout(teacher, env, repo, task, max_turns=30, token_budget=50_000):
     which is close enough for a margin this size."""
     msgs = [{"role": "system", "content": SYSTEM.format(repo=repo)},
             {"role": "user", "content": task["task"]}]
+    return run_turns(teacher, env, msgs, max_turns=max_turns,
+                     token_budget=token_budget)
+
+
+def run_turns(teacher, env, msgs, max_turns=30, token_budget=50_000):
+    """The turn loop, over a message list that may ALREADY have history.
+
+    Split out of rollout() so a trajectory can be continued from an arbitrary
+    prefix -- correction trajectories resume after a spliced-in turn, and the
+    continuation has to behave exactly like a fresh rollout or the data would
+    differ in ways the student could learn (mercurius.data.correction).
+    """
     seen = {}
     chars = lambda: sum(len(m.get("content") or "") + len(m.get("reasoning_content") or "")
                         for m in msgs)

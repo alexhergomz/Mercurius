@@ -24,6 +24,16 @@ def main():
     ap.add_argument("--samples", type=int, default=256,
                     help="CARE reports saturation past ~512; 256 is their default")
     ap.add_argument("--seq", type=int, default=512)
+    ap.add_argument("--calib", default=None, metavar="TXT",
+                    help="calibration corpus. The default (care.CALIB) is "
+                         "FineWeb prose, which was right when the training data "
+                         "was prose and is WRONG now that half the mix is code: "
+                         "CARE whitening preserves the directions carrying energy "
+                         "in the CALIBRATION distribution, so calibrating on prose "
+                         "and training on diffs and agent episodes keeps the wrong "
+                         "subspace. Same domain-bias failure measured for PCA on "
+                         "hidden states (decisions D13). Pass a sample of the "
+                         "actual training mix.")
     ap.add_argument("--out", default=str(CACHE_DIR / 'kv_covs.pt'))
     ap.add_argument("--adapters", default=None,
                     help="trained adapters to calibrate under; default is the "
@@ -43,7 +53,7 @@ def main():
 
     torch.manual_seed(0)
     tok = AutoTokenizer.from_pretrained(CKPT)
-    calib = tok(open(CALIB).read(), return_tensors="pt").input_ids[0]
+    calib = tok(open(a.calib or CALIB).read(), return_tensors="pt").input_ids[0]
     print(f"calibration corpus {len(calib):,} tokens (fineweb-edu)", flush=True)
 
     m = build(a.adapters, gdn2=a.gdn2,
