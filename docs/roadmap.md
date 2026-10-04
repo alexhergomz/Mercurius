@@ -209,6 +209,188 @@ merge_and_restart with jagged LR re-warmup) but merge_and_restart handles only
 LoRALinear; the VeRA merge is not implemented. Measured value of rank
 accumulation with LoRA on this model was +0.4%, so expectations should be modest.
 
+### 1.6 Distil the HIDDEN STATE, not the distribution -- both terms, in nats
+**Confidence: medium-high on cost, unproven on quality. Cost: low. PROPOSED.**
+
+D13 cached the teacher's final hidden state and noted that only the lm_head
+matmul survives (2.5 of 54 GFLOP/token). This removes that too, by expanding both
+loss terms around the teacher's hidden state. With delta = h_s - h_t (or
+P h_t for a narrower teacher), mu = W^T p_t and F = W^T(diag(p)-pp^T)W:
+
+    KL(t||s)    ~=                      1/2 delta^T F delta
+    excess CE   ~=  (mu - w_y)^T delta + 1/2 delta^T F delta
+
+Verified numerically (V=4000, d=64) against exact terms: relative error 0.00% at
+|delta|=0.001 through 0.16% at |delta|=1.0, for BOTH terms. So the objective
+moves entirely into hidden space and STAYS IN NATS -- ce_beta keeps the meaning
+it has today rather than becoming a scale hunt, which is the same reason D12's
+excess-nats formulation was chosen.
+
+What it buys: no softmax over 248,320, no logits tensor, no lm_head in the
+training graph. The linear term (mu - w_y)^T delta is exactly the pressure to
+BEAT the teacher on the true token, so the data term survives intact.
+
+The Fisher never needs to be FORMED -- delta^T F delta is a scalar, equal to
+Var_{v~p}(W delta). It needs p, and that is the whole question. MEASURED on the
+real teacher, held out (n=320):
+
+    teacher mass in top-k      mean     median   10th pct
+       k=64                   0.9888    0.9998    0.9707
+       k=256                  0.9951    0.9999    0.9877
+
+    Fisher quadratic        1/2 dFd    err vs exact
+       exact per-position     0.3890        -
+       cached top-64          0.3979       2.3%
+       cached top-256         0.3920       0.8%
+       GLOBAL (averaged)      0.3660       5.9%
+
+ADOPTED: per-position Fisher from a cached top-64. O(k d) = 131K flop against
+508M for a full softmax -- 3,900x -- at 2.3% error, for 384 extra bytes per
+position beside the int8 h_t.
+
+Two corrections worth keeping. First, an earlier note here claimed top-k was
+unsafe because "the teacher puts only 43.5% of mass in its top-64" -- that was
+measured on the AVERAGE distribution, which is flat by construction. Individual
+positions are extremely peaked. Averaging distributions and then reading off
+concentration measures the wrong object. Second, D12 rejected exactly this cache,
+but for REVERSE KL, where the STUDENT's mass escapes the teacher's support; the
+Fisher is teacher-weighted, so the teacher's own top-k covers what it reads --
+D12 says as much about forward KL. Same artefact, different quantity, opposite
+verdict.
+
+What remains is NOT the Fisher approximation: exact per-position Fisher recovers
+63% of true KL at the starting delta and the global one 59%, so averaging costs
+~4 points while the SECOND-ORDER EXPANSION costs the rest. That error shrinks
+monotonically as training converges (13% at s=1.0, 5.4% at 0.5, 0.6% at 0.05),
+which is the opposite of D12's top-k artefact -- a floor precisely where
+resolution was needed.
+
+Function-preserving init: the expansion is second order, so it is valid only for
+small delta. That is an argument FOR the calibration step, not against the
+method -- fitting the teacher->student map so delta starts small is what keeps
+the objective in its valid regime.
+
+Head alignment for a different-width teacher, measured against the real
+training-time teacher (35B-A3B, d_t=2048, UNTIED output head dequantised from the
+Q6_K GGUF -- no download needed, gguf.quants.dequantize, 3.3 s):
+
+    teacher(2048) via student(2560) column space   uniform 42.4%   usage 95.2%
+    student(2560) via teacher(2048)                uniform 34.8%   usage 94.2%
+
+d_t < d_s makes the teacher->student direction rank-FEASIBLE (the 27B, at 5120,
+was not), and it would leave the student's head untouched with nothing added at
+inference. **It was then measured behaviourally and REJECTED.** On 321 real
+teacher hidden states spanning code, prose, maths, a diff and Spanish,
+reconstructing the teacher's logits through the student's head gives:
+
+    reconstruction    KL(t||r)   KL(r||t)   top-1 agree   top-5 agree
+    B_uniform           1.2106     2.0528         53.6%         56.0%
+    B_usage             0.4332     0.3794         82.2%         78.1%
+    -- for scale --
+    5% random noise on h itself      0.0017
+
+The best case is 250x worse than perturbing the hidden state by 5%, and loses
+18% of top-1 predictions. So 95.2% of "energy explained" buys 82% agreement:
+energy is nearly useless as a fidelity proxy here, exactly as D13 warned (a 4%
+variance shortfall in h produced 1000%+ reverse-KL error, because the head
+amplifies small h differences). Do not revive this direction on an energy number.
+
+**ADOPTED INSTEAD: give the student the TEACHER's output head.** logits =
+W_t (P h_s), P : 2560 -> 2048. Reconstruction error is then zero by construction
+-- there is nothing to approximate -- and the teacher being NARROWER than the
+student makes it cheap:
+
+    factored   W_t (508.6M) + P (5.2M) = 513.8M    exact
+    fused      W_t P (248320 x 2560)   = 635.7M    exact, drop-in shape
+    student's current head               635.7M
+
+Both are exact; only W_s B was lossy. Factored is 122M smaller, fused is
+shape-identical to the head already there. The input embedding still needs W_s,
+so it is +513.8M either way (~+13% of a 4B, ~0.25 GB in NF4).
+
+Function-preserving init -- MEASURED, and the opposite of what was first argued.
+60,000 paired (h_s, h_t) on calib_mix, fitted on the code-heavy first 80% and
+evaluated on the prose tail, so the holdout is a domain shift:
+
+    init for P                        disruption vs student   agree w/ teacher
+    fit P h_s ~= h_t                  KL 0.7401  top-1 74.0%        69.7%
+    fit W_t P ~= W_s, uniform tokens  KL 1.0461  top-1 66.3%        61.7%
+    fit W_t P ~= W_s, usage-weighted  KL 0.0663  top-1 94.2%        82.8%
+    (student today, reference)                                      83.9%
+
+Fit P to PRESERVE THE STUDENT'S OWN LOGITS, usage-weighted -- not to match the
+teacher's hidden state. Matching h_t optimises the training target at the cost of
+destroying the model being started from: it costs 14 points of teacher agreement
+and nearly doubles output entropy (0.91 -> 1.86 nats). The preserving init keeps
+94.2% of top-1, KL 0.066, entropy 0.98, and barely moves teacher agreement.
+Rank (2048 < 2560) does NOT make this direction lossy in practice; UNIFORM token
+weighting does, and catastrophically.
+
+**But the same measurements question the objective itself.** The student already
+agrees with the teacher on 83.9% of top-1 predictions while its hidden state
+linearly predicts h_t at only R^2 = 0.432 held out (0.624 in-domain). The two
+models produce similar OUTPUTS through substantially different REPRESENTATIONS.
+So distilling h is a strictly harder target than distilling logits: it demands
+the student reorganise its representation, not merely reproduce behaviour. That
+may be a richer signal or it may burn capacity enforcing an agreement the
+student's architecture (GDN-2, compressed MLA, NoPE) has no reason to admit.
+Decide it with an arm, not an argument.
+
+Caveats on the numbers above: the usage weights were counted over all 60k
+positions including the held-out tail, so 94.2% is mildly optimistic; and R^2
+describes how far the target starts from the CURRENT student, not whether it is
+reachable by training.
+
+**MEASURED AT LAUNCH, AND IT KILLS THE SWAP ON THIS BUDGET.** The offline numbers
+above were all computed on calib_mix, which is the corpus P's token weights were
+FITTED on -- fitting and validating on the same distribution, which is the
+circularity this file already warns about for PCA (D13). The first number taken
+on the real training/eval distribution says something else:
+
+    converted-untrained, NO head swap (masked150 eval@0)   ppl@8192 11.037
+    converted-untrained, WITH head swap                    ppl@8192 25.858
+                                                           -> 0.851 nats
+
+Against 0.127 nats measured on calib_mix: the swap costs 6.7x more on the eval
+corpus than on the corpus P was fitted against. Refitting the weights helps but
+does not rescue it -- residual energy on the TRAIN distribution goes 12.30%
+(calib-fitted) -> 9.22% (merged) -> 9.01% (train-fitted), so most of the 0.851
+survives any reweighting.
+
+The number that settles it: masked150's ENTIRE 150-step run moved ppl@8192 from
+11.037 to 9.609, i.e. **0.139 nats total**. The head swap costs **0.851 nats at
+initialisation** -- 6x the total gain a full run of this budget has ever
+produced. It cannot pay for itself in 150 steps. That ratio should have been
+computed before the swap was built, not after.
+
+Three options and what each costs at init, for the record:
+
+    A. head swap (built)              0.851 nats damage, exact target
+    B. project teacher -> student     0 damage, target 0.433 nats off the teacher
+    C. on-policy only, reverse KL     0 damage, exact target, no new machinery
+
+C is the one that targets the MEASURED defect (D16: base model 0 stuck
+generations, ours 28; cause `on_policy = 0.0`). A and B are cost and cleanliness
+improvements to the objective, not fixes for the diagnosed problem, and either
+can be evaluated later without paying a 6x handicap.
+
+NOTE: option C still works with the llama.cpp teacher and needs no in-process
+27B. The server returns h_t; the teacher's logits are then W_t h_t using the head
+already dequantised from the GGUF, so reverse KL has both distributions without
+the MoE loader. That part of today's work stands whichever objective is chosen.
+
+**No MoE loader and no download are needed to do any of this.** The teacher's
+head dequantises straight from the Q6_K GGUF (gguf.quants.dequantize, 3.3 s), and
+llama.cpp emits h_t directly: `--embeddings --pooling none --embd-normalize -1`
+returns the post-output_norm, pre-lm_head state, verified by decoding
+W_t h_t into coherent next tokens (' fibonacci'->'(n', '):'->newline,
+' else'->' fibonacci', max prob 0.92-0.95 on syntax). D5/D12 call the
+fused-3D-expert loader the highest-value performance work; that was premised on
+needing in-process teacher LOGITS, which D13's cache plus this objective remove.
+The loader is still needed for ON-POLICY steps, where the teacher must see
+student-generated text.
+
+
 ---
 
 ## Tier 2 — deployment, high confidence, orthogonal to quality
@@ -400,3 +582,26 @@ surgery this pipeline can do. Noted so it is not rediscovered as cheap.
 Kimi trained with Muon. At a 150-step budget optimizer choice plausibly matters,
 but it interacts with every other result and would invalidate comparisons
 against the existing arms. Park until the architecture is settled.
+
+### 4.5 Looped reasoning (recurrent depth) -- RESEARCH FIRST, not scheduled
+
+Added 2026-09-29 on request: to the experiments list, NOT to be started yet. The open
+question is whether and how it can be added to an already-converted student.
+Idea: run a block of layers several times, so the model can spend more compute per token
+("latent reasoning") without growing parameters or the KV cache per token of text.
+
+To research before any design (verify every claim against the papers themselves):
+  * the retrofit literature -- converting a PRETRAINED model into a looped / recursive
+    one (e.g. layer tying with small per-loop adapters) versus training loops from
+    scratch; our constraint is retrofit + distillation, not pretraining.
+  * which block to loop in a hybrid stack: our 24 GDN + 8 MLA layers interleave, and a
+    loop must decide what happens to the GDN recurrent STATE and the MLA KV cache on
+    each pass (reuse, append, or separate per iteration) -- this is the crux for us.
+  * how the number of loops is set: fixed, sampled during training, or adaptive per
+    token (halting / router-based), and what that costs at decode.
+  * interaction with distillation: the teacher does not loop, so what does the student
+    match on each pass; and with the KV-cache work (#58-#59) -- extra passes must not
+    multiply the cache.
+  * evaluation: GSM8K greedy + the MC suite + RULER, at matched compute and cache.
+Deliverable of the research step: a short design note with the chosen variant, its
+state/cache semantics, and a cheap first test -- before any code.
