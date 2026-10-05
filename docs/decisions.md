@@ -3385,3 +3385,17 @@ RULER 32k (deployed 4-bit): EM 79.5%, value NLL 0.098 -- vs v3@3150 bf16 0.081 (
 L1 final bf16 0.126 (+0.028, z +2.3 in favour of the 4-bit v3), original 0.062.
 PG-19 vs original: +0.026 / +0.034 / +0.040 / +0.039 / +0.048 (0-2k ... 32-64k) -- the bf16
 profile shifted up ~+0.03: the 4-bit cost is uniform, not long-range.
+
+### 68.8 Final benchmarks vs the ORIGINAL (greedy, same settings) (2026-10-05)
+The 2026-09-24 "original" generation run was SAMPLED (T=0.6, before #50) -- not comparable.
+Re-run greedy, no-think, max-new 768, NF4 base + bf16 KV (experiments/eval_orig_greedy.sh):
+  original  GSM8K 1210/1319 (91.7%)  HumanEval 128/164 (78.0%)  MBPP 179/257 (69.6%)
+  v3 final, fully 4-bit (eval_v3_bench.sh; GSM8K at batch 32, code at 16):
+            GSM8K 1178/1319 (89.3%)  HumanEval 123/164 (75.0%)  MBPP 166/257 (64.6%)
+  paired v3 vs original: GSM8K 44 vs 76 (p 0.004), HumanEval 16 vs 21 (p 0.51),
+  MBPP 18 vs 31 (p 0.09).
+  v3 vs L1 (bf16): GSM8K p 0.57, HumanEval p 1.0, MBPP p 0.87 -- level;
+  v3 vs P75 (bf16): GSM8K 77 vs 53 (p 0.04, v3 better), code level.
+=> the deployed 4-bit model keeps most of the original's reasoning/code ability, with a
+small, consistent loss (significant on GSM8K) in line with the uniform +0.03-nat 4-bit
+cost (#68.7). The lesson stands: start QAT earlier.

@@ -95,8 +95,19 @@ only ~0.009 of it; the rest is the 4-bit weights. The QAT phase was short (750 s
 learning rate already decaying) and recovered about 30%. Next run: start QAT much
 earlier, or keep the most sensitive weights at 8 bits.
 
-Reasoning and code benchmarks (GSM8K, HumanEval, MBPP) of the previous run were level
-with or above a short-trained baseline; the final model was not re-run on them yet.
+**Reasoning and code** (greedy, no thinking, 768 new tokens; paired per problem):
+
+| | GSM8K | HumanEval | MBPP |
+|---|---|---|---|
+| Original Qwen3.5-4B (4-bit weights, 16-bit KV) | 91.7% | 78.0% | 69.6% |
+| **Mercurius, deployed 4-bit** | 89.3% | 75.0% | 64.6% |
+| difference vs original (p) | −2.4 (0.004) | −3.0 (0.51) | −5.1 (0.09) |
+| Previous run, full precision | 88.8% | 75.6% | 65.4% |
+
+The deployed model keeps most of the original's reasoning and code ability, with a
+small loss that matches the 4-bit cost above. It is level with or better than every
+earlier full-precision student.
+
 Details and every measurement: [docs/decisions.md](docs/decisions.md) (#64–#68).
 
 ## Quick start
