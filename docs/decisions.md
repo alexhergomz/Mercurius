@@ -3368,3 +3368,20 @@ loss beyond ~1 min of steps: TeacherServer now retries for up to 10 min (was 3 a
 the step-1100 resume save; teacher restarted with --cache-ram 0 (same patched binary and
 slots); resumed with TORCHINDUCTOR_COMPILE_THREADS=1. After: teacher RSS 12.5 GiB, 62 GiB
 available, no compile workers.
+
+### 68.7 v3-absorb final (step 3900, annealed QAT): results and the 4-bit cost
+In-training eval (deployed 4-bit form): CE 1.9743 / 2.2089 @2048 / @8192; replay exact.
+Decomposition (replay variants of the final weights, CE @2048 / @8192):
+  fully 4-bit (NF4 weights, TurboQuant-4 latent + RoPE key, NF4 embedding)  1.9743 / 2.2089
+  NF4 weights only (bf16 KV, bf16 embedding)                                1.9770 / 2.1997
+  no quantization at all (same weights)                                     1.9860 / 2.2149
+  step 3150, bf16, before QAT                                               1.9543 / 2.1815
+-> 4-bit KV + embedding cost ~+0.009 @8k; most of the gap is the weights (+0.018 vs 3150).
+   QAT (575 steps, LR already annealing) recovered only ~30% of the PTQ cost (+0.038 ->
+   +0.027 @8k). The weights co-adapted to NF4 (worse when unquantized). LESSON: start QAT
+   much earlier (~40% of training, LR still high) or keep the most sensitive weights at
+   8 bits; the 4-bit KV cache (TurboQuant) itself is cheap.
+RULER 32k (deployed 4-bit): EM 79.5%, value NLL 0.098 -- vs v3@3150 bf16 0.081 (z -2.1),
+L1 final bf16 0.126 (+0.028, z +2.3 in favour of the 4-bit v3), original 0.062.
+PG-19 vs original: +0.026 / +0.034 / +0.040 / +0.039 / +0.048 (0-2k ... 32-64k) -- the bf16
+profile shifted up ~+0.03: the 4-bit cost is uniform, not long-range.

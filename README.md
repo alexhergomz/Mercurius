@@ -64,27 +64,40 @@ whole model           distilled from Qwen3.5-35B-A3B (reverse KL + TAID + CE)
 
 ## Results
 
-Latest run, `v3-absorb`, measured before its final QAT phase (step 3,150 of 3,900,
-20M training tokens). Final numbers replace these when the run ends.
+Run `v3-absorb`: 3,900 steps (25M tokens), the last 750 with quantization-aware
+training. Two versions are reported: the full-precision model just before QAT
+(step 3,150) and the **final deployed model** (4-bit weights, 4-bit KV cache, 4-bit
+embedding).
 
-**Long-context retrieval** (RULER, 5 multi-needle tasks at 32k tokens):
+**Long-context retrieval** (RULER, 5 multi-needle tasks, 32k tokens):
 
 | | exact match | value NLL ↓ |
 |---|---|---|
 | Original Qwen3.5-4B | 100% | 0.062 |
-| **Mercurius v3** | **90.5%** | **0.081** |
-| Previous run (before the RoPE fix) | 73.5% | 0.126 |
+| Mercurius, full precision (step 3,150) | **90.5%** | **0.081** |
+| **Mercurius, deployed 4-bit** | 79.5% | 0.098 |
+| Previous run, full precision (before the RoPE fix) | 73.5% | 0.126 |
+
+At 64k the deployed 4-bit model beats the previous full-precision run on all three
+multi-key tasks (e.g. hardest task NLL 0.100 vs 0.433); the original still leads.
 
 **Long-document modelling** (PG-19, 12 books, NLL above the original; lower is better):
 
 | position | 0–2k | 2–8k | 8–16k | 16–32k | 32–64k |
 |---|---|---|---|---|---|
-| **Mercurius v3** | **−0.007** | +0.003 | +0.009 | +0.008 | +0.015 |
-| Previous run | +0.003 | +0.012 | +0.015 | +0.019 | +0.034 |
+| Mercurius, full precision | **−0.007** | +0.003 | +0.009 | +0.008 | +0.015 |
+| Mercurius, deployed 4-bit | +0.026 | +0.034 | +0.040 | +0.039 | +0.048 |
+| Previous run, full precision | +0.003 | +0.012 | +0.015 | +0.019 | +0.034 |
 
-Short-context quality is at or above the original (distillation from a larger
-teacher). Reasoning and code benchmarks (GSM8K, HumanEval, MBPP) of the previous run
-were level with or above a short-trained baseline; they are re-run on the final model.
+**What 4 bits cost.** About +0.03 nats, nearly the same at every position, so it is a
+global cost, not a long-range one. The 4-bit KV cache (TurboQuant) and embedding cost
+only ~0.009 of it; the rest is the 4-bit weights. The QAT phase was short (750 steps,
+learning rate already decaying) and recovered about 30%. Next run: start QAT much
+earlier, or keep the most sensitive weights at 8 bits.
+
+Reasoning and code benchmarks (GSM8K, HumanEval, MBPP) of the previous run were level
+with or above a short-trained baseline; the final model was not re-run on them yet.
+Details and every measurement: [docs/decisions.md](docs/decisions.md) (#64–#68).
 
 ## Quick start
 
@@ -156,9 +169,9 @@ from its last save.
 
 ## Status
 
-Research project, active. The current run finishes its quantization-aware phase and
-is evaluated end to end (retrieval to 64k, long-document perplexity, GSM8K,
-HumanEval, MBPP). Next: a fused absorbed-decode kernel for deployment.
+Research project. Next: a longer QAT phase (to close the 4-bit gap), GSM8K /
+HumanEval / MBPP on the final model, and a fused absorbed-decode kernel for
+deployment.
 
 ## Acknowledgements
 

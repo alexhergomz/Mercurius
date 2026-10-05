@@ -127,7 +127,17 @@ def main():
                     help="models/fast_infer.py: chunked kernels for every multi-token "
                          "input incl. cache continuation, Triton conv update for decode; "
                          "RULER then scores the gold span in ONE forward")
+    ap.add_argument("--qat", action="store_true")
+    ap.add_argument("--qat-kv-bits", type=int, default=4)
+    ap.add_argument("--qat-kv-group", type=int, default=32)
+    ap.add_argument("--qat-kv-rot", default="none", choices=["none", "orth"])
+    ap.add_argument("--qat-kv-quant", default="int", choices=["int", "tq"])
+    ap.add_argument("--qat-gate-bits", type=int, default=4)
+    ap.add_argument("--qat-embed-bits", type=int, default=4)
     a = ap.parse_args()
+    _qat = (dict(kv_bits=a.qat_kv_bits, kv_group=a.qat_kv_group, kv_rot=a.qat_kv_rot,
+                 gate_bits=a.qat_gate_bits, embed_bits=a.qat_embed_bits,
+                 kv_quant=a.qat_kv_quant) if a.qat else None)
 
     guard.cap_cuda_memory(a.mem_cap_gb)
     pacer = guard.ThermalPacer(84.0, 80.0, 90.0, 85.0)
@@ -145,7 +155,7 @@ def main():
              else build_original_nf4(fast_infer=a.fast_infer) if path == "ORIGINAL_NF4"
              else build(path, a.dc, a.covs, quantize=a.quantize,
                         groups=a.mla_groups, dial=a.dial, merge_eval=a.merge_eval,
-                        fast_infer=a.fast_infer))
+                        fast_infer=a.fast_infer, qat=_qat))
         pacer.attach(m)
         per_book = []
         pos = {}
