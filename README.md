@@ -105,8 +105,14 @@ earlier, or keep the most sensitive weights at 8 bits.
 | Previous run, full precision | 88.8% | 75.6% | 65.4% |
 
 The deployed model keeps most of the original's reasoning and code ability, with a
-small loss that matches the 4-bit cost above. It is level with or better than every
-earlier full-precision student.
+small loss that matches the 4-bit cost above.
+
+**GSM8K is in-domain.** The math training data includes GSM8K's *train* split and
+OpenMathInstruct (built from GSM8K / MATH train problems). The *test* split used here
+is disjoint and was decontaminated (13-gram), so there is no leakage, but the score is
+flattered relative to models without that data. Compare it only with the original
+(which was also trained on such data) and with the previous run (same data).
+HumanEval and MBPP have no in-domain training data.
 
 Details and every measurement: [docs/decisions.md](docs/decisions.md) (#64–#68).
 
@@ -145,7 +151,7 @@ privacy issues ([docs/data_policy.md](docs/data_policy.md)):
 |---|---|
 | 70.6% | FineWeb-Edu, long documents (≥ 8k tokens) |
 | 19.7% | agentic software-engineering episodes (permissive repositories only) |
-| 9.7% | math reasoning (GSM8K, OpenMathInstruct text, procedural problems) |
+| 9.7% | math reasoning (GSM8K *train* split, OpenMathInstruct text, procedural problems) |
 
 Everything is decontaminated against every evaluation set (13-gram overlap).
 

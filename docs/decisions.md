@@ -3399,3 +3399,19 @@ Re-run greedy, no-think, max-new 768, NF4 base + bf16 KV (experiments/eval_orig_
 => the deployed 4-bit model keeps most of the original's reasoning/code ability, with a
 small, consistent loss (significant on GSM8K) in line with the uniform +0.03-nat 4-bit
 cost (#68.7). The lesson stands: start QAT earlier.
+
+### 68.9 CORRECTION: GSM8K is in-domain for every run with the math mix (user)
+The math data (#61) contains GSM8K TRAIN (gsm8k_human 7,473 rows, gsm8k_teacher 7,151;
+scripts/build_math.py split="train") and OpenMathInstruct-1 text (problems from the
+GSM8K / MATH train splits). The benchmark uses the disjoint TEST split, and 13-gram
+decontamination removed 7 + 4 + 5 near-duplicates: no test leakage. But the training is
+IN-DOMAIN for GSM8K, so:
+  * v3 > P75 on GSM8K (p 0.04, #68.8) is WITHDRAWN as evidence of better reasoning: P75
+    had no math data; the gap is most likely the in-domain data.
+  * v3 vs L1 (same math data) stays fair: level.
+  * v3 vs the original is the least biased (Qwen's training very likely includes
+    GSM8K-train-style data); if anything our in-domain data flatters v3, so the true
+    gap may exceed the measured -2.4 points.
+  * HumanEval / MBPP: no in-domain set (code data = agentic SWE episodes, decontaminated).
+For future runs: report GSM8K as in-domain, and add an out-of-domain math benchmark
+(e.g. a held-out source never used for training data) for an unbiased reasoning read.
