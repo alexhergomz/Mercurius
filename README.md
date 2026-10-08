@@ -5,6 +5,8 @@ contexts on modest hardware.** It takes Qwen3.5-4B, rebuilds its memory-hungry p
 into cheaper ones, and then teaches the rebuilt model to behave like the original by
 distillation from a larger teacher. The result reads a **1M-token context in about
 5 GB of memory** instead of about 37 GB, with 4-bit weights and a 4-bit KV cache.
+It runs in llama.cpp (GGUF files and a fork with the needed kernels): **4.4 GB at
+512k tokens** on a Jetson AGX Orin, where Qwen3.5-4B needs 19.3 GB.
 
 <p align="center">
   <b>Qwen3.5-4B &nbsp;→&nbsp; surgery &nbsp;→&nbsp; calibration &nbsp;→&nbsp; distillation &nbsp;→&nbsp; 4-bit QAT</b><br>
@@ -20,11 +22,16 @@ distillation from a larger teacher. The result reads a **1M-token context in abo
 | KV cache per token | 32 KiB (bf16) | **2.3 KiB** (4-bit) — **13.7× smaller** |
 | Cached values per token | 16,384 | 4,640 — 3.53× fewer before quantization |
 | Weights | 8.4 GB (bf16) / 2.2 GB (4-bit) | **2.25 GB** (4-bit, trained for it) |
-| Memory at 8k / 128k / 1M tokens | 2.5 / 6.5 / **36.6 GB** (4-bit weights, f16 KV) | 2.3 / 2.6 / **4.8 GB** |
+| Memory at 8k / 128k / 1M tokens (computed) | 2.5 / 6.5 / **36.6 GB** (4-bit weights, f16 KV) | 2.3 / 2.6 / **4.8 GB** |
+| Measured in llama.cpp, 64k / 512k tokens | 4.5 / **19.3 GB** (f16 KV); 3.2 / 9.2 GB (4-bit KV) | 2.9 / **4.4 GB** |
+| Generation speed at 128k (Jetson Orin) | 15.7 tok/s (f16 KV); 8.9 (4-bit KV) | **15.6 tok/s** |
+| Prefill speed at 128k (Jetson Orin) | 555 tok/s (f16 KV) | 340 tok/s (1.6× slower) |
 | Attention decode | standard | MLA, fully **absorbed** (no key rebuild per token) |
 | 24 of 32 layers | Gated DeltaNet (linear) | **GDN-2** (channel-wise gates), exact lift |
 
-Memory is for one sequence: weights + KV cache + the fixed 52 MB recurrent state.
+Memory is for one sequence: weights + KV cache + the fixed 52 MB recurrent state. Measured rows: llama.cpp's
+GPU buffers (also the attention mask and workspaces), IQ4_NL weights for both models; see
+[docs/deployment.md](docs/deployment.md).
 
 ## How it works
 
@@ -118,7 +125,8 @@ Details and every measurement: [docs/decisions.md](docs/decisions.md) (#64–#68
 
 ## Run it (llama.cpp)
 
-Ready-to-run GGUF files (exact NF4, IQ4_NL, Q4_K, Q5_K, f16) are in the `gguf/` folder of the Hugging Face repository.
+Ready-to-run GGUF files (exact NF4, IQ4_NL, Q4_K, Q5_K, f16) are in the `gguf/` folder of the
+[Hugging Face repository](https://huggingface.co/Minerva-Laboratories/Mercurius-1-4B).
 They need the llama.cpp fork [alexhergomz/llama-mercurius](https://github.com/alexhergomz/llama-mercurius) (branch
 `mercurius`), which keeps the absorbed MLA, GDN-2 and the 4-bit TurboQuant cache. NVIDIA GPUs (Ampere and newer) and
 CPU; not AMD or Apple yet. Measured on a Jetson AGX Orin: **4.4 GB at 512k tokens** (Qwen3.5-4B: 19.3 GB with an f16
@@ -193,7 +201,7 @@ docs/            decision log, data policy, evaluation notes, roadmap
 
 Developed on one NVIDIA GB10 (128 GB unified memory). The trainer and the teacher
 share that memory, so the trainer stops cleanly when free memory runs low and resumes
-from its last save.
+from its last save. Deployment (llama.cpp port) tested on a Jetson AGX Orin 64 GB.
 
 ## Status
 
