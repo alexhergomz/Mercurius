@@ -116,6 +116,15 @@ HumanEval and MBPP have no in-domain training data.
 
 Details and every measurement: [docs/decisions.md](docs/decisions.md) (#64–#68).
 
+## Run it (llama.cpp)
+
+Ready-to-run GGUF files (exact NF4, IQ4_NL, Q4_K, Q5_K, f16) are in the `gguf/` folder of the Hugging Face repository.
+They need the llama.cpp fork [alexhergomz/llama-mercurius](https://github.com/alexhergomz/llama-mercurius) (branch
+`mercurius`), which keeps the absorbed MLA, GDN-2 and the 4-bit TurboQuant cache. NVIDIA GPUs (Ampere and newer) and
+CPU; not AMD or Apple yet. Measured on a Jetson AGX Orin: **4.4 GB at 512k tokens** (Qwen3.5-4B: 19.3 GB with an f16
+cache, 9.2 GB with a 4-bit cache), generation as fast as Qwen3.5-4B with an f16 cache. Details and benchmarks:
+[docs/deployment.md](docs/deployment.md).
+
 ## Quick start
 
 ```bash
@@ -177,6 +186,8 @@ docs/            decision log, data policy, evaluation notes, roadmap
 - [docs/data_policy.md](docs/data_policy.md) — licences, provenance and filters.
 - [docs/evaluation.md](docs/evaluation.md) — how results are measured.
 - [docs/roadmap.md](docs/roadmap.md) — what comes next.
+- [docs/deployment.md](docs/deployment.md) — llama.cpp port, GGUF files, measured memory and speed.
+- [docs/porting_findings.md](docs/porting_findings.md) — issues found while deploying the model (inputs for the next run).
 
 ## Hardware
 
@@ -187,8 +198,9 @@ from its last save.
 ## Status
 
 Research project. Next: a longer QAT phase (to close the 4-bit gap), GSM8K /
-HumanEval / MBPP on the final model, and a fused absorbed-decode kernel for
-deployment.
+HumanEval / MBPP on the final model, and a faster prefill kernel for the 448-wide
+expanded attention. Deployment: the llama.cpp port with fused absorbed decode is
+done ([docs/deployment.md](docs/deployment.md)).
 
 ## Acknowledgements
 
