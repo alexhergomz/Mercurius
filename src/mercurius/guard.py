@@ -152,7 +152,7 @@ class ThermalPacer:
 
     def attach(self, model):
         """Hook every decoder layer of `model`. Returns the number hooked."""
-        from mercurius.legacy.surgery.norm_fusion import get_trunk
+        from mercurius.arch.common import trunk as get_trunk
         n = 0
         for layer in get_trunk(model).layers:
             self._handles.append(layer.register_forward_pre_hook(self.check))
