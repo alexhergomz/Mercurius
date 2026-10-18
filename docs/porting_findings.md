@@ -1,5 +1,12 @@
 # Porting findings: Mercurius-1-4B in deployment (PyTorch deployed form, llama.cpp / GGUF)
 
+**Status in the v2 pipeline** (see the README, "What v2 fixed"): #1 q/k heads expanded at conversion; #3 / #15 ranks
+in multiples of 128; #4 optional low-rank key RMS; #5 the cache quantizer sees the post-RoPE key; #6 the converted
+config describes every replaced module and the cached values per token; #7 RMS cached in fp16 in the QAT forward;
+#9 self-contained checkpoints; #10 one GatedDeltaNet2 class; #11 / #14 standard weight formats instead of NF4; #12 the
+unused decay phase is gone; #13 one adapter per projection. #2 (448-wide keys in the expanded form) and #8 (4-bit KV
+amplifies arithmetic differences between backends) are properties of the design, unchanged.
+
 Written while deploying the final model outside the training code: a PyTorch deployed form (NF4 weights, the packed
 TurboQuant cache as a real runtime) and the llama.cpp port ([alexhergomz/llama-mercurius](https://github.com/alexhergomz/llama-mercurius),
 see [deployment.md](deployment.md)). Each item says what was seen, why it matters, and what a fix would look like.

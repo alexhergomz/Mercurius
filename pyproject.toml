@@ -4,32 +4,34 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mercurius"
-version = "0.1.0"
-description = "Architecture surgery and distillation recovery for Qwen3.5-class models on a single device"
+version = "0.2.0"
+description = "Convert hybrid language models to long-context, low-memory form (GDN-2, absorbable MLA) and distill them back with quantization-aware training"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-
-# Deliberately unpinned except where a version is load-bearing. This runs on a
-# Jetson AGX Orin (sm_87), where torch comes from NVIDIA's wheel index rather
-# than PyPI -- pinning torch here would make the project uninstallable on the
-# one machine it was built for. See README "Hardware notes".
+# torch is not pinned: Jetson / GB10 wheels come from NVIDIA's index.
 dependencies = [
     "torch>=2.4",
-    "transformers>=4.57",
+    "transformers>=5.6",
     "safetensors>=0.4",
-    "bitsandbytes>=0.43",
+    "huggingface_hub>=0.24",
     "numpy>=1.26",
+    "pyyaml>=6",
 ]
 
 [project.optional-dependencies]
-# causal-conv1d has no published wheel for sm_87 and must be built from source:
-#   TORCH_CUDA_ARCH_LIST=8.7 pip install -v --no-build-isolation causal-conv1d
-# Worth it: 12x on that op, which runs 18 times per forward pass.
-kernels = ["causal-conv1d>=1.4"]
+# fla: the fused GDN-2 / causal-conv Triton kernels (without it the PyTorch reference path runs: slow, CPU-capable)
+kernels = ["flash-linear-attention>=0.5"]
+# gguf: read a llama.cpp teacher's output head; bitsandbytes: nf4 teachers and the legacy NF4 format
+teachers = ["gguf>=0.10", "bitsandbytes>=0.43"]
+monitor = ["nvidia-ml-py"]
+test = ["pytest>=8"]
+
+[project.scripts]
+mercurius = "mercurius.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-dir]
-"" = "src"
+[tool.pytest.ini_options]
+testpaths = ["tests"]

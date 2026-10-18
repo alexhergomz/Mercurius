@@ -1,0 +1,16 @@
+# Several teachers: the student's original (keeps its own behaviour) and a larger model over a llama.cpp server
+# (adds capability). teacher_combine: loss = weighted sum of per-teacher divergences; mixture = one target, the
+# weighted mixture of the teachers' distributions.
+run:
+  name: multi-4b
+student:
+  model: Qwen/Qwen3.5-4B
+teachers:
+  - {kind: hf, model: student, weight: 0.3}
+  - {kind: server, url: "http://127.0.0.1:8077", gguf: models/Qwen3.5-35B-A3B-Q4_K_M.gguf, weight: 0.7}
+teacher_combine: mixture
+data:
+  text: data/fineweb_edu_long_v2.txt
+  eval_text: data/wikitext.txt
+train:
+  steps: 3000

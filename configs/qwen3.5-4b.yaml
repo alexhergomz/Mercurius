@@ -1,0 +1,31 @@
+# Mercurius-1-Perihelion-4B recipe on the v2 pipeline: Qwen3.5-4B student, Qwen3.5-35B-A3B teacher served by
+# llama.cpp, the Mercurius-1 data mix and schedule, QAT from the start of the last quarter with standard formats
+# (q4_0 weights, q8_0 gates) and a FoveaKV 4-bit cache.
+#   mercurius run configs/qwen3.5-4b.yaml
+run:
+  name: perihelion-4b
+student:
+  model: Qwen/Qwen3.5-4B
+teachers:
+  - kind: server
+    url: http://127.0.0.1:8077
+    gguf: models/Qwen3.5-35B-A3B-Q4_K_M.gguf      # its output head is read from here
+convert:
+  mla: {budget: 4096, rank_multiple: 128, n_rope: 1}
+data:
+  text: data/fineweb_edu_long_v2.txt
+  episodes: {path: data/episodes/pilot_mix.decon.jsonl, frac: 0.29}
+  math: {path: data/math/math_final.decon.jsonl, frac: 0.16}
+  eval_text: data/wikitext.txt
+  seq: 8192
+  length_mix: {4096: 0.318, 8192: 0.629, 32768: 0.053}
+train:
+  steps: 6300
+  lr: 3.0e-5
+  adapter_lr: 1.0e-2
+  qmap_lr: 1.0e-3
+  divergence: reverse
+  eval_every: 525
+  guards: {mem_cap_gb: 60}
+qat:
+  start_step: 4200

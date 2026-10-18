@@ -1,21 +1,103 @@
 # Mercurius
 
-**Mercurius turns a trained small language model into one that can read very long
-contexts on modest hardware.** It takes Qwen3.5-4B, rebuilds its memory-hungry parts
-into cheaper ones, and then teaches the rebuilt model to behave like the original by
-distillation from a larger teacher. The result reads a **1M-token context in about
-5 GB of memory** instead of about 37 GB, with 4-bit weights and a 4-bit KV cache.
-It runs in llama.cpp (GGUF files and a fork with the needed kernels): **4.4 GB at
-512k tokens** on a Jetson AGX Orin, where Qwen3.5-4B needs 19.3 GB.
+**Mercurius turns a trained hybrid language model into one that reads very long contexts on modest hardware.**
+It rebuilds the memory-hungry parts of a model such as Qwen3.5 into cheaper ones, then teaches the rebuilt model
+to behave like the original (or a larger teacher) by distillation, training directly against its deployed 4-bit form.
+The first model, Mercurius-1-4B, reads a **1M-token context in about 5 GB** instead of about 37 GB.
 
 <p align="center">
-  <b>Qwen3.5-4B &nbsp;→&nbsp; surgery &nbsp;→&nbsp; calibration &nbsp;→&nbsp; distillation &nbsp;→&nbsp; 4-bit QAT</b><br>
-  <i>one GPU box, open data, no training from scratch</i>
+  <b>student &nbsp;→&nbsp; surgery &nbsp;→&nbsp; calibration &nbsp;→&nbsp; distillation + QAT &nbsp;→&nbsp; export</b><br>
+  <i>one config file, one command, open data</i>
 </p>
 
----
+## Quick start
 
-## At a glance
+```bash
+bash scripts/setup_spark.sh --teacher          # venv, PyTorch (CUDA 13), Mercurius, patched llama.cpp
+bash scripts/teacher_server.sh models/Qwen3.5-35B-A3B-Q4_K_M.gguf &    # only for server teachers
+mercurius run configs/qwen3.5-4b.yaml          # convert -> distill + QAT -> export (resumes after any stop)
+mercurius eval runs/perihelion-4b/export --text data/wikitext.txt
+```
+
+Stages can also run one by one (`mercurius convert | train | export`), and every config value can be overridden on
+the command line: `mercurius run configs/qwen3.5-9b.yaml train.lr=2e-5 qat.weights=iq4_nl`.
+
+## What the pipeline does
+
+| stage | what changes | cost |
+|---|---|---|
+| fold norms | RMSNorm gains move into the projections; folded norms become one learned scalar (ScaleNorm) | exact |
+| GDN-2 lift | Gated DeltaNet → Gated DeltaNet-2: channel-wise decay, erase and write gates, row-tiled from the scalar gates; q/k heads expanded to the value heads | exact |
+| absorbable MLA | each attention layer's K/V → one CARE latent (whitened SVD, ranks water-filled across layers in multiples of 128) + a small exact RoPE key (TransMLA RoRoPE); decode absorbs the up-projections | lossy, measured per layer |
+| distillation | VeRA adapters (rank 1024) on every projection, dense latents, per-head query maps in the RoPE commutant; reverse KL + TAID + excess cross-entropy against one or more teachers | training |
+| QAT | from `qat.start_step` the forward sees the deployed model: merged weights rounded to their format, the KV cache through its quantizer | training |
+| export | adapters merged, weights packed in their formats, a self-contained checkpoint | exact (bit-identical to the QAT forward) |
+
+### Configuration
+
+One YAML file per run (`configs/`); every key and its default is in `src/mercurius/config.py`, and unknown keys
+are an error. The main choices:
+
+- **student**: any Hugging Face checkpoint of the Qwen3.5 / Qwen3-Next hybrid family (or plain-attention Qwen3);
+  multimodal checkpoints are loaded text-only.
+- **teachers**: a list. `kind: hf` loads a model in-process (`model: student` = the student's own original
+  weights, i.e. self-distillation; the same checkpoint can be both); `kind: server` queries a llama.cpp server for
+  final hidden states and reads the output head straight from the GGUF. Several teachers combine by weight, as a sum
+  of divergences (`teacher_combine: loss`) or as one mixture target (`mixture`).
+- **convert.mla**: latent budget, `rank_multiple`, number of RoPE components, low-rank key-RMS (`k_rms`).
+- **train.amp**: `bf16` (default), `fp16` (with a gradient scaler) or `none`. Trainables always keep fp32 masters.
+- **qat**: weight formats (`q4_0` default, `iq4_nl`, `q8_0`, `bf16`; `nf4` only to reproduce Mercurius-1),
+  separate formats for the GDN-2 gates and the embedding, and the KV-cache format: `foveakv` (default: FoveaKV's
+  gain-shape 4-bit pages with block means and a randomized Hadamard rotation), `turboquant`, `int` or `none`.
+
+### Outputs
+
+`runs/<name>/`: `converted/` (the model after surgery, loadable on its own), `ckpt/` (resume state and trained
+tensors), `export/` (the deployable model), `config.resolved.json` and `train_log.json`. Any of the model
+directories loads with `mercurius.arch.model.load_model(path)` -- no surgery is replayed and no side files are
+needed.
+
+## What v2 fixed
+
+The first model was built with a research trainer (`src/mercurius/legacy/`, kept for reproducibility). Deploying
+it (llama.cpp port, HgRT) produced [a list of issues](docs/porting_findings.md); v2 addresses them:
+
+| finding | v2 |
+|---|---|
+| odd latent ranks (579, 451, ...) blocked block formats and tensor cores | ranks water-filled in multiples of `rank_multiple` (128) |
+| NF4 weights: a format no standard runtime runs | QAT against standard formats (q4_0 / iq4_nl / q8_0), exported packed |
+| GDN layers: 16 key heads shared by 32 value heads, expanded at run time anyway | q/k heads expanded to the value heads at conversion (exact) |
+| the linear layers were called "KDA" and lifted again at load time | one `GatedDeltaNet2` class, saved as such |
+| the decay gate carried two low-rank corrections (VeRA + an in-class LoRA) | one adapter per projection |
+| a release was a research checkpoint needing `build()`, rotation files and cwd-relative paths | self-contained checkpoints (`load_model`) |
+| RoPE key quantized before RoPE (un-rotation on every read) | the cache quantizer sees the post-RoPE key |
+| key RMS needed a full extra projection | optional low-rank key-RMS (`convert.mla.k_rms`) |
+| trainables in bf16 (small steps rounded away) | fp32 masters, mixed-precision compute (AMP) |
+| teacher head dumped by hand from the GGUF | read from the GGUF automatically |
+
+## Repository layout
+
+```
+src/mercurius/
+  config.py      the run configuration (defaults, validation, overrides)
+  cli.py         mercurius run | convert | train | export | eval | info
+  arch/          the converted model: GDN-2, absorbable MLA / plain attention, norms, save / load
+  convert/       exact stages (norm folding, GDN-2 lift), MLA conversion + sequential calibration, pipeline
+  adapters.py    VeRA
+  quant/         weight formats, KV-cache quantizers (FoveaKV, TurboQuant, int), QAT
+  teachers.py    in-process and llama.cpp-server teachers
+  train/         training mix, losses (divergences, TAID), trainer
+  export.py      merged, packed, self-contained checkpoints
+  data/          episode / math data builders and loaders
+  legacy/        the Mercurius-1 research code (trainer, surgery variants, evaluations)
+configs/         run configurations
+scripts/         setup, teacher server, data builders (scripts/data)
+research/        Mercurius-1 experiment scripts and logs
+tests/           CPU tests on a tiny model: exactness of every exact stage, formats, end-to-end run, resume
+docs/            decision log, findings, data policy, deployment
+```
+
+## Mercurius-1-4B at a glance
 
 | | Original Qwen3.5-4B | Mercurius |
 |---|---|---|
@@ -33,43 +115,7 @@ Memory is for one sequence: weights + KV cache + the fixed 52 MB recurrent state
 GPU buffers (also the attention mask and workspaces), IQ4_NL weights for both models; see
 [docs/deployment.md](docs/deployment.md).
 
-## How it works
-
-Qwen3.5-4B is a hybrid: 24 linear-attention layers (Gated DeltaNet) and 8 softmax
-attention layers. Only the 8 attention layers keep a cache that grows with context,
-so that is where the compression goes.
-
-```
- 8 attention layers   K,V per head ──► one shared latent (CARE whitened SVD, water-filled ranks)
-                      RoPE part    ──► one small exact RoPE key per layer (TransMLA RoRoPE)
-                      → absorbable MLA: the cache holds the latent, not the keys
-
-24 linear layers      GatedDeltaNet ──► GDN-2: per-channel decay, erase and write gates
-                      lifted exactly from the trained weights, then adapted
-
-whole model           distilled from Qwen3.5-35B-A3B (reverse KL + TAID + CE)
-                      then quantization-aware training: NF4 weights, TurboQuant 4-bit KV
-```
-
-1. **Surgery.** Each change starts exactly where the original model was, or with a
-   measured, small loss. The attention layers become Multi-head Latent Attention:
-   keys and values share one latent per token, factorized in the *whitened* basis of
-   real activations (CARE), with ranks water-filled across layers under a fixed
-   budget. Rotary position encoding is split out first (TransMLA's RoRoPE: one
-   orthogonal mix of heads per frequency, which commutes with RoPE), so decoding is
-   fully absorbed like DeepSeek's MLA.
-2. **Calibration.** Covariances come from the training mix itself, layer by layer, on
-   the partly compressed model (sequential calibration).
-3. **Distillation.** A live 35B-A3B teacher (llama.cpp server) gives hidden states;
-   the student matches its distribution with reverse KL, a TAID schedule, and
-   cross-entropy. Adapters are VeRA (rank 1024) plus the dense latents. Long-context
-   windows (up to 32k tokens) are part of the mix.
-4. **Quantization-aware training.** The model trains against its deployed form:
-   NF4 weights with adapters merged, and a TurboQuant-MSE 4-bit KV cache (fixed random
-   rotation + Lloyd-Max codebook + one norm per token). The rotations and codebooks
-   are saved with the model.
-
-## Results
+### Results
 
 Run `v3-absorb`: 3,900 steps (25M tokens), the last 750 with quantization-aware
 training. Two versions are reported: the full-precision model just before QAT
@@ -123,42 +169,6 @@ HumanEval and MBPP have no in-domain training data.
 
 Details and every measurement: [docs/decisions.md](docs/decisions.md) (#64–#68).
 
-## Run it (llama.cpp)
-
-Ready-to-run GGUF files (exact NF4, IQ4_NL, Q4_K, Q5_K, f16) are in the `gguf/` folder of the
-[Hugging Face repository](https://huggingface.co/Minerva-Laboratories/Mercurius-1-4B).
-They need the llama.cpp fork [alexhergomz/llama-mercurius](https://github.com/alexhergomz/llama-mercurius) (branch
-`mercurius`), which keeps the absorbed MLA, GDN-2 and the 4-bit TurboQuant cache. NVIDIA GPUs (Ampere and newer) and
-CPU; not AMD or Apple yet. Measured on a Jetson AGX Orin: **4.4 GB at 512k tokens** (Qwen3.5-4B: 19.3 GB with an f16
-cache, 9.2 GB with a 4-bit cache), generation as fast as Qwen3.5-4B with an f16 cache. Details and benchmarks:
-[docs/deployment.md](docs/deployment.md).
-
-## Quick start
-
-```bash
-pip install -e .
-
-# Teacher: llama.cpp server with the split-embedding patch (long prompts in 8k chunks)
-git -C <llama.cpp> apply patches/llama.cpp-split-pooling-none-embeddings.patch   # commit 4ceb171
-LLAMA_SPLIT_EMBD_NONE=1 llama-server -m Qwen3.5-35B-A3B-Q4_K_M.gguf --embeddings \
-  --pooling none --embd-normalize -1 -ngl 99 -c 67584 -b 8192 -ub 8192 \
-  --parallel 2 --cache-ram 0 --port 8077
-
-# Train (conversion, calibration, distillation and QAT in one run)
-bash experiments/run_v2.sh --go
-bash experiments/run_v2.sh --go --resume     # after any interruption
-
-# Evaluate a snapshot (rebuilds the exact trained model, then RULER / long PPL)
-python experiments/replay_check.py --arm A=ckpt/adapters-<tag>-step<N>.pt \
-  --covs cache/mla_seqcal_<key>_covs.pt --groups cache/mla_seqcal_<key>_groups.json \
-  --dial c0 --merge-eval --expect <CE@2048> <CE@8192>
-python -m mercurius.eval.ruler --arms A=<ckpt> --quantize --merge-eval --fast-infer \
-  --covs <covs> --mla-groups <groups> --dial c0 --lengths 32768 65536
-```
-
-Runs resume exactly: weights, optimizer moments, LR schedule, TAID state, every
-sampler and RNG stream, and a fingerprint of the data files are saved every 25 steps.
-
 ## Data
 
 Only openly licensed data that allows commercial use, with no share-alike and no
@@ -172,46 +182,21 @@ privacy issues ([docs/data_policy.md](docs/data_policy.md)):
 
 Everything is decontaminated against every evaluation set (13-gram overlap).
 
-## Repository layout
-
-```
-src/mercurius/
-  surgery/       MLA conversion (transmla.py, mla_rope.py), GDN-2 / KDA lifts,
-                 per-head query maps, RoPE dial, norm fusion
-  calibration/   activation covariances, sequential MLA calibration
-  models/        GDN-2 / KDA layers, QAT (qat.py), fast inference paths
-  recovery/      distillation trainer, teacher-server client
-  eval/          RULER, long-context perplexity, retrieval, benchmarks
-experiments/     run scripts, evaluations, diagnostics
-patches/         llama.cpp patch for long-prompt hidden states
-docs/            decision log, data policy, evaluation notes, roadmap
-```
-
 ## Documentation
 
-- [docs/decisions.md](docs/decisions.md) — every design decision with the measurement
-  behind it, including the mistakes and how they were found.
-- [docs/data_policy.md](docs/data_policy.md) — licences, provenance and filters.
-- [docs/evaluation.md](docs/evaluation.md) — how results are measured.
-- [docs/roadmap.md](docs/roadmap.md) — what comes next.
-- [docs/deployment.md](docs/deployment.md) — llama.cpp port, GGUF files, measured memory and speed.
-- [docs/porting_findings.md](docs/porting_findings.md) — issues found while deploying the model (inputs for the next run).
+- [docs/porting_findings.md](docs/porting_findings.md) -- issues found deploying Mercurius-1 and how v2 answers them.
+- [docs/decisions.md](docs/decisions.md) -- every design decision of Mercurius-1 with the measurement behind it.
+- [docs/data_policy.md](docs/data_policy.md) -- licences, provenance and filters.
+- [docs/deployment.md](docs/deployment.md) -- the llama.cpp port of Mercurius-1.
+- [docs/evaluation.md](docs/evaluation.md), [docs/roadmap.md](docs/roadmap.md).
 
 ## Hardware
 
-Developed on one NVIDIA GB10 (128 GB unified memory). The trainer and the teacher
-share that memory, so the trainer stops cleanly when free memory runs low and resumes
-from its last save. Deployment (llama.cpp port) tested on a Jetson AGX Orin 64 GB.
-
-## Status
-
-Research project. Next: a longer QAT phase (to close the 4-bit gap), GSM8K /
-HumanEval / MBPP on the final model, and a faster prefill kernel for the 448-wide
-expanded attention. Deployment: the llama.cpp port with fused absorbed decode is
-done ([docs/deployment.md](docs/deployment.md)).
+Developed on one NVIDIA GB10 (DGX Spark, 128 GB unified memory); deployment tested on a Jetson AGX Orin 64 GB.
+The trainer caps its CUDA allocator (`train.guards.mem_cap_gb`), stops cleanly when free memory runs low and
+resumes from its last save, and pauses when the GPU runs hot.
 
 ## Acknowledgements
 
-Built on Qwen3.5 (Apache-2.0), flash-linear-attention, llama.cpp, and the ideas of
-TransMLA, DeepSeek-V2 MLA, CARE / SVD-LLM, Gated DeltaNet-2, Kimi Delta Attention,
-VeRA, TAID and TurboQuant.
+Built on Qwen3.5 (Apache-2.0), flash-linear-attention, llama.cpp, and the ideas of TransMLA, DeepSeek-V2 MLA,
+CARE / SVD-LLM, Gated DeltaNet-2, Kimi Delta Attention, VeRA, TAID, TurboQuant and FoveaKV.
